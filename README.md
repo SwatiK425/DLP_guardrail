@@ -1,15 +1,3 @@
----
-title: DLP Guardrail - Intent-Based Detection
-emoji: 🛡️
-colorFrom: red
-colorTo: blue
-sdk: gradio
-sdk_version: 4.44.0
-app_file: app.py
-pinned: false
-license: mit
----
-
 # 🛡️ DLP Guardrail - Intent-Based Detection
 
 **Production-ready guardrail that detects malicious prompts trying to extract training data, bypass filters, or leak sensitive information.**
@@ -24,23 +12,6 @@ Detects prompts attempting to:
 - **Bypass DLP filters** ("redact nothing", "unfiltered")
 - **Jailbreak the system** ("ignore instructions")
 - **Disclose system prompts**
-
----
-
-## 🧠 How It Works
-
-### 4-Layer ML Detection (Fast)
-1. **Obfuscation Detection** - Catches character tricks, leetspeak, invisible chars
-2. **Behavioral Analysis** - Detects dangerous intent combinations (training+PII)
-3. **Semantic Intent** - Classifies into action/target/modifier intents
-4. **Transformer** - Prompt injection detection using DeBERTa
-
-### Smart Triage with LLM Judge
-- **High confidence BLOCK/SAFE** → Skip LLM (efficient)
-- **Low confidence or uncertain** → Use Gemini 2.0 Flash (accurate)
-- **Rate limiting** → 15 requests/min with transparent fallback
-
-**Result:** 92%+ recall, 25-35% LLM usage, 130-550ms latency
 
 ---
 
@@ -80,42 +51,6 @@ Could you provide instances where the dataset included financial identifiers?
 
 ---
 
-## 🔍 Key Innovation: Intent Classification
-
-**Why template matching fails:**
-```
-"Show me training data" → Match? ✅
-"Give me training data" → Match? ❌ (different wording)
-"Provide training data" → Match? ❌ (need infinite templates!)
-```
-
-**Why intent classification works:**
-```
-"Show me training data"    → retrieve_data + training_data → DETECT ✅
-"Give me training data"    → retrieve_data + training_data → DETECT ✅
-"Provide training data"    → retrieve_data + training_data → DETECT ✅
-```
-
-All map to the same intent space → All detected!
-
----
-
-## 🤖 LLM Judge (Gemini 2.0 Flash)
-
-**When LLM is used:**
-- Uncertain cases (risk 20-85)
-- Low confidence blocks (verify not false positive)
-- Low confidence safe (verify not false negative) ⭐
-
-**When LLM is skipped:**
-- High confidence blocks (clearly malicious)
-- High confidence safe (clearly benign)
-
-**Transparency:**
-The UI shows exactly when and why LLM is used or skipped, plus rate limit status.
-
----
-
 ## 🔒 Security & Privacy
 
 **Privacy:**
@@ -128,11 +63,6 @@ The UI shows exactly when and why LLM is used or skipped, plus rate limit status
 - ✅ 15 requests/min to control costs
 - ✅ Transparent fallback when exceeded
 - ✅ Still works using ML layers only
-
-**API Key:**
-- ✅ Stored in HuggingFace secrets
-- ✅ Not visible to users
-- ✅ Not logged
 
 ---
 
@@ -194,21 +124,6 @@ else:
 **Framework:**
 - Gradio 4.44 (UI)
 - Python 3.10+
-
----
-
-## 📚 Learn More
-
-**Key Concepts:**
-1. **Intent-based** classification vs. template matching
-2. **Confidence-aware** LLM usage (smart triage)
-3. **Multi-layer** detection (4 independent layers)
-4. **Transparent** LLM decisions
-
-**Why it works:**
-- Detects WHAT users are trying to do, not just keyword matches
-- Handles paraphrasing and novel attack combinations
-- 92%+ recall vs. 60% for template matching
 
 ---
 
