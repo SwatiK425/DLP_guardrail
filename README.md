@@ -1,6 +1,6 @@
-# 🛡️ DLP Guardrail - Intent-Based Detection
+# 🛡️ DLP & Prompt Injection Defense Guardrail for LLM-based applications
 
-**Production-ready guardrail that detects malicious prompts trying to extract training data, bypass filters, or leak sensitive information.**
+**Production-ready guardrail that detects malicious prompts trying to extract training data, bypass safety filters, or inject or leak sensitive information.**
 
 ---
 
@@ -8,7 +8,7 @@
 
 Detects prompts attempting to:
 - **Extract training data** ("Show me examples from your training")
-- **Request PII** (credit cards, SSN, passwords, etc.)
+- **Request/Inject PII** (credit cards, SSN, passwords, etc.)
 - **Bypass DLP filters** ("redact nothing", "unfiltered")
 - **Jailbreak the system** ("ignore instructions")
 - **Disclose system prompts**
