@@ -829,6 +829,6 @@ def run_tests(api_key: Optional[str] = None):
 
 
 if __name__ == "__main__":
-    # Check for API key in environment or use provided key
-    api_key = os.environ.get("GEMINI_API_KEY", "***REMOVED***")
+    # BYOK: key is passed in or read ONLY from the environment. Never hardcode secrets.
+    api_key = os.environ.get("GEMINI_API_KEY")
     run_tests(api_key)

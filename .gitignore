@@ -1,0 +1,32 @@
+# ---- Secrets / environment ----
+.env
+*.env
+.env.*
+!.env.example
+*key*
+*secret*
+*.pem
+
+# ---- Python cache ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- Model artifacts / downloads ----
+models/
+*.bin
+*.safetensors
+.cache/
+!**/models/test_data/
+
+# ---- Build/runtime ----
+venv/
+.venv/
+dist/
+build/
+*.log
+.DS_Store
+
+# ---- IDE ----
+.idea/
+.vscode/

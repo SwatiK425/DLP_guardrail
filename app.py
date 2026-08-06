@@ -17,7 +17,8 @@ from collections import defaultdict
 from dlp_guardrail_with_llm import IntentGuardrailWithLLM
 
 # Initialize guardrail
-API_KEY = os.environ.get("GEMINI_API_KEY", "***REMOVED***")
+# BYOK: key is read ONLY from environment. Never hardcode secrets.
+API_KEY = os.environ.get("GEMINI_API_KEY")
 guardrail = IntentGuardrailWithLLM(gemini_api_key=API_KEY, rate_limit=15)
 
 
