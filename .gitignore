@@ -25,6 +25,7 @@ venv/
 dist/
 build/
 *.log
+*.jsonl
 .DS_Store
 
 # ---- IDE ----
