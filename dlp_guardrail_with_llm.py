@@ -19,12 +19,15 @@ from datetime import datetime, timedelta
 import os
 
 # Optional: Try to import ML libraries
+# Layer 2 embeddings now run on fastembed (ONNX), so torch is NOT required.
 try:
-    from sentence_transformers import SentenceTransformer
-    SEMANTIC_AVAILABLE = True
+    from fastembed import TextEmbedding
+    FASTEMBED_AVAILABLE = True
 except ImportError:
-    SEMANTIC_AVAILABLE = False
-    print("⚠️  sentence-transformers not installed. Install with: pip install sentence-transformers")
+    FASTEMBED_AVAILABLE = False
+    print("⚠️  fastembed not installed. Install with: pip install fastembed")
+# Backward-compat alias: some callers reference SEMANTIC_AVAILABLE.
+SEMANTIC_AVAILABLE = FASTEMBED_AVAILABLE
 
 try:
     from transformers import pipeline
@@ -261,42 +264,66 @@ class ObfuscationDetector:
 
 class BehavioralAnalyzer:
     """Detects compositional behavioral patterns"""
-    
+
     def __init__(self):
         self.behavioral_patterns = {
             "data_exfiltration_markers": {
                 "training_references": [
-                    r"(?i)\b(training|trained\s+on|learned|memorized)\b",
+                    r"(?i)\b(training\s+(data|set|memory|examples|records|output|logs))",
+                    r"(?i)\b(trained\s+on|memoriz\w*)\b",
                     r"(?i)\b(dataset|corpus|knowledge\s+base)\b",
                     r"(?i)\bfrom\s+your\s+(training|data|knowledge)\b",
                 ],
                 "pii_identifiers": [
                     r"(?i)\b(credit\s*card|payment\s*card)\b",
                     r"(?i)\b(ssn|social\s*security)\b",
-                    r"(?i)\b(passport|driver.*licen[cs]e)\b",
-                    r"(?i)\b(pii|personal\s*information)\b"
+                    r"(?i)\b(passport|driver.?s?\s*licen[cs]e)\b",
+                    r"(?i)\b(pii|personal\s*information|financial\s*identif)\b",
+                    r"(?i)\b(bank\s+(account|details|number))\b",
                 ],
                 "unfiltered_requests": [
-                    r"(?i)\bredact\s+(nothing|none|zero)\b",
-                    r"(?i)\b(don't|do\s*not|never)\s+(redact|censor|filter)\b",
+                    r"(?i)redact\s+(nothing|none|zero)\b",
+                    r"(?i)\b(don'?t|do\s*not|never|with\s*out)\s+(redact|censor|filter)\b",
                     r"(?i)\b(unfiltered|uncensored|raw|unredacted)\b",
                 ]
             },
             "system_manipulation": {
                 "jailbreak_attempts": [
-                    r"(?i)\b(ignore|bypass|override|disregard)\b.*\b(instructions?|rules?|prompts?|guidelines?)\b",
+                    r"(?i)\b(ignore|bypass|override|disregard)\b.*\b(instructions?|rules?|prompts?|guidelines?|filters?|protocols?|limits?)\b",
                     r"(?i)\byou\s+(are\s+now|must\s+now)\b",
+                    r"(?i)\bbypass\s+(all\s+)?(filters?|restrictions?)\b",
                 ],
                 "role_manipulation": [
                     r"(?i)\b(act\s+as|pretend|roleplay|you\s+are\s+now)\b",
-                    r"(?i)\b(dan|jailbreak)\s+mode\b",
+                    r"(?i)\b(dan|jailbreak|developer\s+mode|devmode)\b",
+                    r"(?i)\b(unrestricted|new\s+ai)\b",
+                ],
+                "disclosure_requests": [
+                    r"(?i)\b(system\s+prompt|base\s+prompt|your\s+instructions?)\b",
+                    r"(?i)\b(first\s+\d+\s+(tokens?|words?|characters?))\b",
+                    r"(?i)\breveal\s+(your|the|it)\b",
+                    r"(?i)\b(show\s+me|print|output|say|give)\s+(your|the)\s+(system\s+)?(prompt|instructions?)\b",
                 ]
             }
         }
-    
+
+        # Intent-combination signals: separate benign mentions of sensitive words
+        # from real exfiltration intent ("intent, not keyword").
+        self.retrieval_re = re.compile(
+            r"(?i)\b(?<!in\s)(show|give|provide|list|extract|reproduce|return|get|"
+            r"tell\s*me|examples|instances|access|reveal|dump|print|output)\b"
+        )
+        self.target_re = re.compile(
+            r"(?i)(training\s+(data|set|memory|output|logs|examples)|dataset|corpus|"
+            r"credit\s*card|ssn|social\s*security|passport|email\s*(addresses|of)|"
+            r"personal\s+info|financial\s+identifiers|bank\s+(details|numbers)|"
+            r"raw\s+(logs|conversations|text|outputs)|memorized|base\s+prompt|"
+            r"system\s+prompt|internal\s+tools)"
+        )
+
     def analyze(self, prompt: str) -> Dict:
         behaviors_detected = []
-        
+
         for category, patterns_dict in self.behavioral_patterns.items():
             for behavior_name, patterns in patterns_dict.items():
                 matched = False
@@ -304,38 +331,58 @@ class BehavioralAnalyzer:
                     if re.search(pattern, prompt):
                         matched = True
                         break
-                
+
                 if matched:
                     behaviors_detected.append({
                         "category": category,
                         "behavior": behavior_name
                     })
-        
-        has_training_ref = any(b["behavior"] == "training_references" for b in behaviors_detected)
-        has_pii = any(b["behavior"] == "pii_identifiers" for b in behaviors_detected)
-        has_unfiltered = any(b["behavior"] == "unfiltered_requests" for b in behaviors_detected)
-        has_jailbreak = any(b["behavior"] == "jailbreak_attempts" for b in behaviors_detected)
-        
+
+        names = {b["behavior"] for b in behaviors_detected}
+        has_training = "training_references" in names
+        has_pii = "pii_identifiers" in names
+        has_unfiltered = "unfiltered_requests" in names
+        has_jailbreak = "jailbreak_attempts" in names
+        has_role = "role_manipulation" in names
+        has_disclosure = "disclosure_requests" in names
+
+        lower = prompt.lower()
+        retrieval = bool(self.retrieval_re.search(lower))
+        target = bool(self.target_re.search(lower))
+
+        # ---- Intent-based scoring (not bare-keyword) ----
         risk_score = 0
-        if has_training_ref and has_pii:
+        # 1. Hardest intent: expose the system/base prompt
+        if has_disclosure:
+            risk_score = 88
+        # 2. Jailbreak overlaid with a high-risk signal
+        elif has_jailbreak and (has_role or has_unfiltered or has_disclosure or retrieval):
             risk_score = 90
-        elif has_pii and has_unfiltered:
-            risk_score = 85
-        elif has_training_ref and has_unfiltered:
-            risk_score = 80
-        elif has_training_ref:
-            risk_score = 60
-        elif has_pii:
-            risk_score = 55
-        elif has_unfiltered:
-            risk_score = 50
+        # 3. Role takeover that reaches for data/access
+        elif has_role and (retrieval or target or has_disclosure):
+            risk_score = 78
         elif has_jailbreak:
+            risk_score = 72
+        # 4. Sensitive data reachable via retrieval intent (real exfil)
+        elif retrieval and target:
+            if any(w in lower for w in ("credit card", "ssn", "social security",
+                                        "dataset", "training data", "memorized",
+                                        "passport", "email", "financial")):
+                risk_score = 85
+            else:
+                risk_score = 65
+        # 5. Unfiltered + retrieval (dump raw output)
+        elif has_unfiltered and (retrieval or target):
             risk_score = 70
-        
+
+        # Bare sensitive target with NO retrieval intent -> benign
+        if not retrieval and not has_role and not has_disclosure and not has_jailbreak:
+            risk_score = 0
+
         return {
             "risk_score": risk_score,
             "behaviors_detected": behaviors_detected,
-            "has_combination": (has_training_ref and has_pii) or (has_pii and has_unfiltered),
+            "has_combination": has_training and (has_pii or has_unfiltered),
         }
 
 
@@ -343,14 +390,14 @@ class IntentBasedSemanticAnalyzer:
     """Intent-based semantic analysis"""
     
     def __init__(self):
-        if not SEMANTIC_AVAILABLE:
+        if not FASTEMBED_AVAILABLE:
             self.use_embeddings = False
             return
-        
-        print("🧠 Loading semantic model...")
-        self.model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+
+        print("🧠 Loading semantic model (fastembed / ONNX)...")
+        self.model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
         self.use_embeddings = True
-        
+
         self.intent_dimensions = {
             "action_intents": {
                 "retrieve_data": ["show me", "give me", "provide", "display", "list"],
@@ -364,12 +411,12 @@ class IntentBasedSemanticAnalyzer:
                 "unfiltered": ["redact nothing", "unfiltered", "uncensored", "raw"],
             }
         }
-        
+
         self.intent_centroids = {}
         for dimension_name, intents in self.intent_dimensions.items():
             self.intent_centroids[dimension_name] = {}
             for intent_name, examples in intents.items():
-                embeddings = self.model.encode(examples, show_progress_bar=False)
+                embeddings = np.array(list(self.model.embed(examples)))
                 centroid = np.mean(embeddings, axis=0)
                 centroid = centroid / np.linalg.norm(centroid)
                 self.intent_centroids[dimension_name][intent_name] = centroid
@@ -395,7 +442,7 @@ class IntentBasedSemanticAnalyzer:
         if not self.use_embeddings:
             return self._fallback_analysis(prompt)
         
-        prompt_embedding = self.model.encode([prompt], show_progress_bar=False)[0]
+        prompt_embedding = np.array(list(self.model.embed([prompt])))[0]
         prompt_embedding = prompt_embedding / np.linalg.norm(prompt_embedding)
         
         intent_scores = {}
@@ -714,33 +761,46 @@ class IntentGuardrailWithLLM:
         return result
     
     def _fuse_layers(self, obfuscation_risk, behavioral_result, semantic_result, transformer_result) -> Dict:
-        """Confidence-weighted fusion"""
+        """
+        Escalation-aware fusion (recall-first).
+
+        Only layers that produced a NON-ZERO signal participate in the average.
+        A silent/fallback layer (risk 0, model not loaded) abstains instead of
+        pulling a genuine mid-level signal back down to "safe". This is the
+        uncertainty gate: low-confidence fallback layers escalate, they don't dilute.
+        """
         signals = [
             (obfuscation_risk, 0.8),
             (behavioral_result["risk_score"], 0.85),
-            (semantic_result["risk_score"], semantic_result["confidence"]),
-            (transformer_result["risk_score"], transformer_result.get("injection_confidence", 0.7))
+            (semantic_result["risk_score"], semantic_result.get("confidence", 0.0)),
+            (transformer_result["risk_score"], transformer_result.get("injection_confidence", 0.0))
         ]
-        
-        high_conf = [(r, c) for r, c in signals if c > 0.6]
-        
-        if not high_conf:
-            return {"risk_score": max(r for r, _ in signals), "confidence": "LOW"}
-        
-        total_weight = sum(c for _, c in high_conf)
-        weighted_risk = sum(r * c for r, c in high_conf) / total_weight
-        
-        risks = [r for r, _ in high_conf]
-        agreement = (max(risks) - min(risks)) < 25
-        
-        max_confident_risk = max(r for r, c in high_conf if c > 0.8) if any(c > 0.8 for _, c in high_conf) else max(risks)
-        
-        if max_confident_risk >= 80:
-            return {"risk_score": max_confident_risk, "confidence": "HIGH"}
-        elif agreement:
-            return {"risk_score": int(weighted_risk), "confidence": "HIGH"}
+
+        # A layer that reports 0 risk is abstaining — exclude it from the average.
+        engaged = [(r, c) for r, c in signals if r > 0]
+
+        if not engaged:
+            return {"risk_score": 0, "confidence": "HIGH"}
+
+        # Any confidently-high signal stands on its own (do not average it down).
+        max_confident = max((r for r, c in engaged if c > 0.8), default=0)
+        if max_confident >= 70:
+            # Escalate: confidently-detected risk is authoritative.
+            return {"risk_score": max_confident, "confidence": "HIGH"}
+        if max_confident >= 40:
+            return {"risk_score": max_confident, "confidence": "MEDIUM"}
+
+        # Otherwise weight-average only the engaged (non-zero) signals.
+        total_weight = sum(c for _, c in engaged)
+        if total_weight > 0:
+            weighted = sum(r * c for r, c in engaged) / total_weight
         else:
-            return {"risk_score": int((weighted_risk + max(risks)) / 2), "confidence": "MEDIUM"}
+            weighted = max(r for r, _ in engaged)
+
+        risks = [r for r, _ in engaged]
+        agreement = (max(risks) - min(risks)) < 25
+        conf = "HIGH" if agreement else "MEDIUM"
+        return {"risk_score": int(weighted), "confidence": conf}
     
     def _score_to_verdict(self, risk_score: int) -> str:
         if risk_score >= 80:

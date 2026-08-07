@@ -1,6 +1,12 @@
+# Core runtime (required)
 gradio==4.44.0
 google-generativeai==0.8.3
-sentence-transformers==3.2.1
-transformers==4.46.3
-torch==2.5.1
 numpy==1.26.4
+# Layer 2 embeddings — ONNX, no torch required.
+fastembed>=0.5.0
+
+# Optional — the deBERTa-class Layer 3 classifier. Skip these and the engine
+# gracefully falls back (Layer 3 abstains; fusion escalates on the remaining
+# signals). Install only if you want the extra transformer detector:
+# transformers==4.46.3
+# torch==2.5.1
