@@ -284,7 +284,7 @@ class BehavioralAnalyzer:
             },
             "system_manipulation": {
                 "jailbreak_attempts": [
-                    r"(?i)\b(ignore|bypass|override|disregard)\b.*\b(instruction|rule|prompt)\b",
+                    r"(?i)\b(ignore|bypass|override|disregard)\b.*\b(instructions?|rules?|prompts?|guidelines?)\b",
                     r"(?i)\byou\s+(are\s+now|must\s+now)\b",
                 ],
                 "role_manipulation": [
