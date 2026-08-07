@@ -17,9 +17,13 @@ from collections import defaultdict
 from dlp_guardrail_with_llm import IntentGuardrailWithLLM
 
 # Initialize guardrail
-# BYOK: key is read ONLY from environment. Never hardcode secrets.
-API_KEY = os.environ.get("GEMINI_API_KEY")
-guardrail = IntentGuardrailWithLLM(gemini_api_key=API_KEY, rate_limit=15)
+# BYOK: key is read ONLY from the chosen provider's environment variable.
+#   provider:  LLM_PROVIDER (default google)  — google|anthropic|openai|openrouter|opencode-zen
+#   key env:   GEMINI_API_KEY | ANTHROPIC_API_KEY | OPENAI_API_KEY | OPENROUTER_API_KEY | OPENCODE_ZEN_API_KEY
+#   model:     LLM_MODEL (optional override; per-provider defaults otherwise)
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "google")
+LLM_MODEL = os.environ.get("LLM_MODEL")
+guardrail = IntentGuardrailWithLLM(provider=LLM_PROVIDER, model=LLM_MODEL, rate_limit=15)
 
 
 def analyze_individual(prompt: str) -> tuple:

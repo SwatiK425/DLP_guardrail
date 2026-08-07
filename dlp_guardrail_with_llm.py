@@ -1,12 +1,15 @@
 """
-Intent-Based DLP Guardrail with Gemini LLM Judge
+Intent-Based DLP Guardrail with Provider-Agnostic LLM Judge (BYOK)
 Complete implementation with rate limiting and transparent LLM usage
 
 New Features:
-- Gemini 2.5 Flash integration for uncertain cases
+- BYOK: user chooses a provider (google/anthropic/openai/openrouter/opencode-zen)
+  and supplies their own key (from env or at prompt time, never hardcoded)
+- Optional per-provider model override with sensible defaults
+- Provider + model + masked key logged so the user can verify their key is in use
 - Rate limiting (15 requests/min) with transparent fallback
 - User-facing transparency about LLM usage
-- Enhanced triage logic
+- Enhanced triage logic (confident block/safe skip the LLM)
 """
 
 import numpy as np
@@ -37,41 +40,88 @@ except ImportError:
     TRANSFORMER_AVAILABLE = False
     print("⚠️  transformers not installed. Install with: pip install transformers torch")
 
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-    print("⚠️  google-generativeai not installed. Install with: pip install google-generativeai")
-
 
 # ============================================================================
-# GEMINI LLM JUDGE WITH RATE LIMITING
 # ============================================================================
+# PROVIDER-AGNOSTIC LLM JUDGE (BYOK)
+# ============================================================================
+# Bring Your Own Key: pick a provider, supply a key via its env var (or at
+# prompt time), optionally override the model. Keys are NEVER hardcoded and
+# NEVER printed in full — we log provider + model + a masked key so you can
+# verify the key you supplied is the one actually in use.
 
-class GeminiLLMJudge:
-    """Gemini-based LLM judge with rate limiting and transparency"""
-    
-    def __init__(self, api_key: str, rate_limit: int = 15):
-        """
-        Initialize Gemini judge with rate limiting
-        
+PROVIDER_BASE_URLS = {
+    "google": "https://generativelanguage.googleapis.com/v1beta/",
+    "anthropic": "https://api.anthropic.com/v1/",
+    "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "opencode-zen": "https://opencode.ai/zen/v1",
+}
+
+# Sensible defaults; the user may override the model at setup time.
+PROVIDER_DEFAULT_MODELS = {
+    "google": "gemini-2.5-flash",
+    "anthropic": "claude-3-5-haiku-latest",
+    "openai": "gpt-4o-mini",
+    "openrouter": "openrouter/auto",
+    "opencode-zen": "deepseek-v4-flash-free",
+}
+
+# Each provider reads its key ONLY from its own env var (BYOK contract).
+PROVIDER_ENV_KEYS = {
+    "google": "GEMINI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "opencode-zen": "OPENCODE_ZEN_API_KEY",
+}
+
+
+def mask_key(key: str) -> str:
+    """Never print a key — return a short mask so the user can confirm which key is live."""
+    if not key:
+        return "<unset>"
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:3]}...{key[-4:]}"
+
+
+class ProviderLLMJudge:
+    """Provider-agnostic LLM judge with rate limiting and transparency.
+
+    Supports any provider in PROVIDER_BASE_URLS via its native REST API:
+    OpenAI-compatible chat/completions for openai/openrouter/opencode-zen,
+    generateContent for google, messages for anthropic. Falls back to
+    layer-fusion when the judge is unavailable or rate-limited.
+    """
+
+    def __init__(self, provider: str, api_key: str, model: Optional[str] = None, rate_limit: int = 15):
+        """Initialize the judge for the chosen provider.
+
         Args:
-            api_key: Gemini API key
-            rate_limit: Max requests per minute (default: 15)
+            provider: one of PROVIDER_BASE_URLS (google|anthropic|openai|openrouter|opencode-zen)
+            api_key: the user's own key for that provider (BYOK)
+            model: optional model override; defaults to PROVIDER_DEFAULT_MODELS[provider]
+            rate_limit: max requests per minute (default 15)
         """
-        if not GEMINI_AVAILABLE:
-            raise ImportError("google-generativeai not installed. Run: pip install google-generativeai")
-        
+        if provider not in PROVIDER_BASE_URLS:
+            raise ValueError(
+                f"Unknown provider '{provider}'. Choose from: {', '.join(PROVIDER_BASE_URLS)}"
+            )
+        self.provider = provider
         self.api_key = api_key
+        self.model = model or PROVIDER_DEFAULT_MODELS[provider]
         self.rate_limit = rate_limit
         self.request_times = deque()
-        
-        # Configure Gemini
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        
-        # System prompt for DLP analysis
+        self.base_url = PROVIDER_BASE_URLS[provider].rstrip("/")
+
+        # BYOK transparency: log provider + model + masked key so the user can
+        # verify their key is the one being used. The full key is never printed.
+        print(
+            f"✅ [BYOK] LLM judge active — provider={provider}, model={self.model}, "
+            f"key={mask_key(api_key)} (env: {PROVIDER_ENV_KEYS[provider]})"
+        )
+
         self.system_prompt = """You are a Data Loss Prevention (DLP) security analyst. Analyze the following prompt for potential security risks.
 
 Focus on detecting:
@@ -90,79 +140,134 @@ Respond with a JSON object containing:
 }
 
 Be conservative: When uncertain, lean toward higher risk scores."""
-        
-        print(f"✅ Gemini LLM Judge initialized (Rate limit: {rate_limit}/min)")
-    
+
     def _check_rate_limit(self) -> Tuple[bool, str]:
         """Check if we're within rate limit"""
         now = datetime.now()
-        
+
         # Remove requests older than 1 minute
         while self.request_times and (now - self.request_times[0]) > timedelta(minutes=1):
             self.request_times.popleft()
-        
+
         # Check if we can make a request
         if len(self.request_times) >= self.rate_limit:
             wait_time = 60 - (now - self.request_times[0]).seconds
             return False, f"Rate limit reached ({self.rate_limit}/min). Wait {wait_time}s"
-        
+
         return True, ""
-    
+
+    def _post(self, url: str, headers: Dict, payload: Dict) -> Optional[Dict]:
+        """POST JSON to the provider endpoint; returns parsed response or None."""
+        try:
+            import requests
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code != 200:
+                print(f"⚠️  [BYOK:{self.provider}] HTTP {resp.status_code}: {resp.text[:200]}")
+                return None
+            return resp.json()
+        except ImportError:
+            print("⚠️  [BYOK] requests not installed. Run: pip install requests")
+            return None
+        except Exception as e:
+            print(f"⚠️  [BYOK:{self.provider}] request failed: {e}")
+            return None
+
+    def _call_provider(self, full_prompt: str) -> Optional[str]:
+        """Call the provider's native API; returns raw response text or None."""
+        if self.provider == "google":
+            url = f"{self.base_url}/models/{self.model}:generateContent"
+            payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
+            headers = {"x-goog-api-key": self.api_key}
+            data = self._post(url, headers, payload)
+            if not data:
+                return None
+            try:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError, TypeError):
+                return None
+
+        elif self.provider == "anthropic":
+            url = f"{self.base_url}/messages"
+            payload = {
+                "model": self.model,
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": full_prompt}],
+            }
+            headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}
+            data = self._post(url, headers, payload)
+            if not data:
+                return None
+            try:
+                return data["content"][0]["text"]
+            except (KeyError, IndexError, TypeError):
+                return None
+
+        else:
+            # OpenAI-compatible chat/completions (openai / openrouter / opencode-zen)
+            url = f"{self.base_url}/chat/completions"
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": full_prompt}],
+                "temperature": 0.2,
+            }
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            data = self._post(url, headers, payload)
+            if not data:
+                return None
+            try:
+                return data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                return None
+
     def analyze(self, prompt: str) -> Optional[Dict]:
-        """
-        Analyze prompt using Gemini with rate limiting
-        
+        """Analyze prompt using the chosen provider, with rate limiting.
+
         Returns:
-            Dict with risk_score, verdict, reasoning, or None if rate limited
+            Dict with risk_score, verdict, reasoning, or None if rate limited/errored.
         """
         # Check rate limit
         can_proceed, message = self._check_rate_limit()
         if not can_proceed:
             print(f"⚠️  {message}")
             return None
-        
+
         # Record this request
         self.request_times.append(datetime.now())
-        
-        try:
-            # Call Gemini
-            full_prompt = f"{self.system_prompt}\n\nPROMPT TO ANALYZE:\n{prompt}"
-            response = self.model.generate_content(full_prompt)
-            
-            # Parse response
-            response_text = response.text.strip()
-            
-            # Try to extract JSON
-            import json
-            # Find JSON in response
-            json_match = re.search(r'\{[^}]+\}', response_text, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group(0))
+
+        full_prompt = f"{self.system_prompt}\n\nPROMPT TO ANALYZE:\n{prompt}"
+        response_text = self._call_provider(full_prompt)
+        if response_text is None:
+            return None
+
+        # Robust JSON extraction: first { to last } (handles nested braces)
+        import json
+        start = response_text.find("{")
+        end = response_text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                result = json.loads(response_text[start:end + 1])
                 return {
                     "risk_score": int(result.get("risk_score", 50)),
                     "verdict": result.get("verdict", "MEDIUM_RISK"),
                     "reasoning": result.get("reasoning", "LLM analysis"),
-                    "detected_threats": result.get("detected_threats", [])
+                    "detected_threats": result.get("detected_threats", []),
                 }
-            else:
-                # Fallback: Parse manually
-                risk_score = 50
-                if "risk_score" in response_text.lower():
-                    match = re.search(r'risk_score["\s:]+(\d+)', response_text)
-                    if match:
-                        risk_score = int(match.group(1))
-                
-                return {
-                    "risk_score": risk_score,
-                    "verdict": self._score_to_verdict(risk_score),
-                    "reasoning": response_text[:200],
-                    "detected_threats": []
-                }
-        
-        except Exception as e:
-            print(f"⚠️  Gemini error: {e}")
-            return None
-    
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Fallback: manual risk_score parse
+        risk_score = 50
+        match = re.search(r'risk_score["\s:]+(\d+)', response_text)
+        if match:
+            risk_score = int(match.group(1))
+
+        return {
+            "risk_score": risk_score,
+            "verdict": self._score_to_verdict(risk_score),
+            "reasoning": response_text[:200],
+            "detected_threats": [],
+        }
+
     def _score_to_verdict(self, score: int) -> str:
         if score >= 80:
             return "BLOCKED"
@@ -171,26 +276,27 @@ Be conservative: When uncertain, lean toward higher risk scores."""
         elif score >= 40:
             return "MEDIUM_RISK"
         return "SAFE"
-    
+
     def get_status(self) -> Dict:
         """Get current rate limit status"""
         now = datetime.now()
-        
+
         # Clean old requests
         while self.request_times and (now - self.request_times[0]) > timedelta(minutes=1):
             self.request_times.popleft()
-        
+
         remaining = self.rate_limit - len(self.request_times)
-        
+
         return {
             "requests_used": len(self.request_times),
             "requests_remaining": remaining,
             "rate_limit": self.rate_limit,
-            "available": remaining > 0
+            "available": remaining > 0,
+            "provider": self.provider,
+            "model": self.model,
         }
 
 
-# ============================================================================
 # IMPORT EXISTING LAYERS (from previous code)
 # ============================================================================
 
@@ -586,31 +692,59 @@ class IntentGuardrailWithLLM:
     - 20 < Risk < 85: Use LLM if available
     """
     
-    def __init__(self, gemini_api_key: Optional[str] = None, rate_limit: int = 15):
+    def __init__(self, gemini_api_key: Optional[str] = None, rate_limit: int = 15,
+                 provider: Optional[str] = None, model: Optional[str] = None,
+                 api_key: Optional[str] = None):
+        """
+        BYOK initialization.
+
+        Args:
+            gemini_api_key: (legacy alias) key for the google provider.
+            api_key: explicit key for the chosen provider (preferred). If omitted,
+                the key is read from that provider's env var (GEMINI_API_KEY,
+                ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY,
+                OPENCODE_ZEN_API_KEY). Never hardcoded.
+            provider: one of PROVIDER_BASE_URLS (default 'google').
+            model: optional model override; defaults per provider.
+            rate_limit: requests per minute for the LLM judge (default 15).
+        """
         print("\n" + "="*80)
         print("🚀 Initializing Intent-Based Guardrail with LLM Judge")
         print("="*80)
-        
+
         self.obfuscation_detector = ObfuscationDetector()
         self.behavioral_analyzer = BehavioralAnalyzer()
         self.semantic_analyzer = IntentBasedSemanticAnalyzer()
         self.transformer_detector = IntentAwareTransformerDetector()
-        
+
+        # Resolve provider + key (BYOK).
+        self.provider = provider or "google"
+        if provider and provider not in PROVIDER_BASE_URLS:
+            print(f"⚠️  Unknown provider '{provider}'. Defaulting to 'google'.")
+            self.provider = "google"
+
+        chosen_key = api_key or gemini_api_key
+        if not chosen_key:
+            chosen_key = os.environ.get(PROVIDER_ENV_KEYS.get(self.provider, "GEMINI_API_KEY"))
+        self.api_key = chosen_key
+
         # Initialize LLM judge
         self.llm_judge = None
-        if gemini_api_key and GEMINI_AVAILABLE:
+        if self.api_key:
             try:
-                self.llm_judge = GeminiLLMJudge(gemini_api_key, rate_limit)
+                self.llm_judge = ProviderLLMJudge(
+                    self.provider, self.api_key, model=model, rate_limit=rate_limit
+                )
             except Exception as e:
-                print(f"⚠️  Failed to initialize Gemini: {e}")
-        
+                print(f"⚠️  Failed to initialize LLM judge: {e}")
+
         if not self.llm_judge:
             print("⚠️  LLM judge unavailable. Using fallback for uncertain cases.")
-        
+
         # Triage thresholds
         self.CONFIDENT_BLOCK = 85
         self.CONFIDENT_SAFE = 20
-        
+
         print("="*80)
         print("✅ Guardrail Ready!")
         print("="*80 + "\n")
@@ -848,13 +982,17 @@ class IntentGuardrailWithLLM:
 # TESTING
 # ============================================================================
 
-def run_tests(api_key: Optional[str] = None):
-    """Run tests with optional LLM"""
+def run_tests(api_key: Optional[str] = None, provider: Optional[str] = None,
+              model: Optional[str] = None):
+    """Run tests with optional LLM (BYOK: provider + key + optional model)."""
     print("\n" + "="*80)
     print("🧪 TESTING GUARDRAIL WITH LLM INTEGRATION")
     print("="*80 + "\n")
-    
-    guardrail = IntentGuardrailWithLLM(gemini_api_key=api_key)
+    if api_key:
+        print(f"🔑 BYOK: provider={provider or 'google'} (key via env/prompt, masked, never logged)")
+        print("-" * 40)
+
+    guardrail = IntentGuardrailWithLLM(gemini_api_key=api_key, provider=provider, model=model)
     
     test_cases = [
         {
@@ -888,7 +1026,55 @@ def run_tests(api_key: Optional[str] = None):
         result = guardrail.analyze(test['prompt'], verbose=True)
 
 
+def interactive_byok_setup() -> Tuple[str, Optional[str], Optional[str]]:
+    """Ask the user for a provider, provide a key, optionally pick a model.
+
+    Returns:
+        (provider, api_key_or_None, model_or_None)
+    """
+    print("\n=== BYOK LLM JUDGE SETUP ===")
+    print("Choose a provider (defaults shown):")
+    for idx, name in enumerate(PROVIDER_BASE_URLS, 1):
+        print(f"  {idx}) {name:<14} default model: {PROVIDER_DEFAULT_MODELS[name]}")
+    print("  Enter a number or a provider name.")
+
+    while True:
+        choice = input("Provider [enter for google]: ").strip().lower()
+        if not choice:
+            provider = "google"
+            break
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(PROVIDER_BASE_URLS):
+                provider = list(PROVIDER_BASE_URLS)[idx - 1]
+                break
+            print(f"  Invalid number. Choose 1-{len(PROVIDER_BASE_URLS)}.")
+            continue
+        if choice in PROVIDER_BASE_URLS:
+            provider = choice
+            break
+        print(f"  Unknown provider '{choice}'. Try again.")
+
+    env_name = PROVIDER_ENV_KEYS[provider]
+    api_key = os.environ.get(env_name)
+    if api_key:
+        print(f"  ✓ Using {env_name} from environment (key: {mask_key(api_key)})")
+    else:
+        api_key = input(f"  Enter your {env_name} (leave blank to skip LLM): ").strip()
+
+    model_default = PROVIDER_DEFAULT_MODELS[provider]
+    model = input(f"  Model [enter = default '{model_default}']: ").strip()
+    model = model or None
+
+    print(f"\n[BYOK] Configured: provider={provider}, model={model or model_default}, "
+          f"key={'SET (masked: ' + mask_key(api_key) + ')' if api_key else 'NOT SET (fallback only)'}")
+    print("=" * 40 + "\n")
+    return provider, (api_key or None), model
+
+
 if __name__ == "__main__":
-    # BYOK: key is passed in or read ONLY from the environment. Never hardcode secrets.
-    api_key = os.environ.get("GEMINI_API_KEY")
-    run_tests(api_key)
+    # BYOK: key is read from the chosen provider's env var and is never
+    # hardcoded or logged. The interactive prompt lets the user verify which
+    # provider + model their key is tied to.
+    provider, api_key, model = interactive_byok_setup()
+    run_tests(api_key, provider=provider, model=model)
