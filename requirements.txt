@@ -5,6 +5,8 @@ requests>=2.31.0
 # gradio 4.44 calls TemplateResponse positionally; starlette >=1.0 broke that
 # (reads the context dict as the template name). Pin to the 0.x gradio targets.
 starlette==0.41.3
+# gradio_client pulls httpx at import time (gradio 4.44 requirement)
+httpx==0.28.1
 # Layer 2 embeddings — ONNX, no torch required.
 fastembed>=0.5.0
 
