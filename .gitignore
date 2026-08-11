@@ -44,3 +44,5 @@ HANDOFF.md
 PROPOSAL.md
 SYSTEM_DESIGN.md
 My notes.txt
+eval_dataset_v2.csv
+probe_layers.py
