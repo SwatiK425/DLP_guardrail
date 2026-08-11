@@ -31,3 +31,10 @@ build/
 # ---- IDE ----
 .idea/
 .vscode/
+
+# ---- Dev/test artifacts (stay local, never pushed) ----
+benchmark.py
+eval_dataset.csv
+test_engine.py
+test_dlp_gate.py
+test_judge.py
