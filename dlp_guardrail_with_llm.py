@@ -748,6 +748,39 @@ class IntentGuardrailWithLLM:
         print("="*80)
         print("✅ Guardrail Ready!")
         print("="*80 + "\n")
+
+    def set_llm_judge(self, provider: Optional[str] = None, api_key: Optional[str] = None,
+                      model: Optional[str] = None, rate_limit: int = 15) -> bool:
+        """Attach/replace the LLM judge at runtime (BYOK in the UI).
+
+        Lets a user plug in their own key + provider + model WITHOUT rebuilding
+        the heavy semantic layers. The key is only ever stored on the judge
+        (for auth) and logged masked — never printed in full.
+
+        Returns:
+            True if a judge is now attached, False otherwise.
+        """
+        if provider and provider not in PROVIDER_BASE_URLS:
+            print(f"⚠️  Unknown provider '{provider}'. Defaulting to 'google'.")
+            provider = "google"
+        provider = provider or self.provider
+
+        chosen_key = api_key or os.environ.get(PROVIDER_ENV_KEYS.get(provider, "GEMINI_API_KEY"))
+        self.provider = provider
+        self.api_key = chosen_key
+
+        self.llm_judge = None
+        if chosen_key:
+            try:
+                self.llm_judge = ProviderLLMJudge(provider, chosen_key, model=model, rate_limit=rate_limit)
+            except Exception as e:
+                print(f"⚠️  Failed to initialize LLM judge: {e}")
+        else:
+            print(f"⚠️  No {PROVIDER_ENV_KEYS.get(provider)} provided — key unattached.")
+
+        if not self.llm_judge:
+            print("⚠️  LLM judge unavailable. Using fallback for uncertain cases.")
+        return self.llm_judge is not None
     
     def analyze(self, prompt: str, verbose: bool = False) -> Dict:
         """Full analysis with transparent LLM usage"""
