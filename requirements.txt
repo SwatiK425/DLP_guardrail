@@ -1,4 +1,7 @@
 # Core runtime (required)
+# IMPORTANT: install with PYTHONPATH unset (e.g. `env -u PYTHONPATH python -m pip install -r requirements.txt`).
+# The Hermes desktop shell leaks PYTHONPATH -> its own venv site-packages, which makes pip think
+# dependencies are satisfied and skip them, and makes verification look green when the .venv is broken.
 gradio==4.44.1
 numpy==1.26.4
 requests>=2.31.0
