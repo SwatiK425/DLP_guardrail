@@ -38,3 +38,9 @@ eval_dataset.csv
 test_engine.py
 test_dlp_gate.py
 test_judge.py
+# ---- Internal docs (stay local) ----
+DLP_GUARDRAIL.md
+HANDOFF.md
+PROPOSAL.md
+SYSTEM_DESIGN.md
+My notes.txt
