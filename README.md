@@ -29,7 +29,7 @@ Each prompt gets a verdict and a per-layer score breakdown, so you see *why* it 
 | 3. **Semantic intent** | Paraphrased intent | Embedding similarity (all-MiniLM-L6-v2, ONNX) |
 | 4. **Injection model** | Real-world injection patterns | Fine-tuned deBERTa-v3 classifier |
 
-An optional **LLM judge** (bring-your-own-key: Gemini, Anthropic, OpenAI, OpenRouter) reviews uncertain cases — and only those, keeping cost low.
+**LLM judge** (bring-your-own-key: Gemini, Anthropic, OpenAI, OpenRouter) is the **final arbiter**: it verifies every prompt that isn't a confident layer block — including safe-looking ones — so subtle attacks can't slip through (recall-first). Only a layer block at risk ≥ 85 with high confidence skips the LLM.
 
 **Verdicts:** 🚫 `BLOCKED` (≥80) · ⚠️ `HIGH_RISK` (≥60) · ⚡ `MEDIUM_RISK` (≥40) · ✅ `SAFE`
 
@@ -53,7 +53,7 @@ python app.py
 # → opens http://localhost:7860
 ```
 
-No API key needed to start — all 4 ML layers run locally. Add a key (via the UI or env vars like `GEMINI_API_KEY`, `OPENAI_API_KEY`) to enable the LLM judge for uncertain cases.
+No API key needed to start — all 4 ML layers run locally. Add a key (via the UI or env vars like `GEMINI_API_KEY`, `OPENAI_API_KEY`) to enable the LLM judge as the final verifier of every non-confident-block prompt.
 
 ### Use as a library
 
@@ -94,7 +94,7 @@ forward(payload if decision.action == "ALLOW" else decision.redacted)
 
 - **Recall 100%** — every attack in the evaluation set was caught (no false negatives).
 - 2 borderline false positives (administrative phrases like *"disable the filter for testing"*) — flagged as high-risk out of caution.
-- LLM judge only fires on the uncertain band — keeps per-request cost at ~$0 for the bulk of traffic.
+- LLM judge is the final arbiter for every prompt that isn't a confident layer block (incl. safe-looking ones) — with a key attached, expect LLM usage on the bulk of traffic; without a key, the ML layers run alone.
 
 ---
 

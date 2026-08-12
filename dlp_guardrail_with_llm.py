@@ -858,44 +858,31 @@ class IntentGuardrailWithLLM:
         result["risk_score"] = fusion_result["risk_score"]
         result["confidence"] = fusion_result["confidence"]
         
-        # SMART TRIAGE WITH CONFIDENCE-AWARE LLM USAGE
-        # Strategy:
-        # 1. High confidence BLOCK → Skip LLM (clearly malicious)
-        # 2. Low/medium confidence BLOCK → Use LLM (might be false positive)
-        # 3. High confidence SAFE → Skip LLM (clearly benign)
-        # 4. Low/medium confidence SAFE → Use LLM (might miss attacks!)
-        # 5. Uncertain (20-85) → Always use LLM
-        
+        # SMART TRIAGE — LLM IS THE FINAL ARBITER (user-mandated 2026-08-11)
+        # Only a HIGH-confidence layer BLOCK short-circuits without the LLM.
+        # EVERYTHING else — INCLUDING safe-looking prompts — is reviewed by the
+        # LLM judge before a verdict is issued. Rationale: attacks can look safe
+        # (the "list_tables" FN, subtle injections); heuristic layers alone can
+        # all miss them. Recall-first: never mark SAFE without LLM confirmation.
+        # Cost note: with a key attached, LLM usage approaches 100% of
+        # non-confident-block traffic; the rate limit (15/min default) governs it.
+
         use_llm = False
         triage_reason = ""
-        
-        if fusion_result["risk_score"] >= self.CONFIDENT_BLOCK:
-            # High risk - but check confidence
-            if fusion_result["confidence"] == "HIGH":
-                # Confident block - skip LLM
-                result["verdict"] = "BLOCKED"
-                triage_reason = "Confident block (risk >= 85, confidence HIGH) - LLM not needed"
-            else:
-                # Low/medium confidence block - verify with LLM
-                use_llm = True
-                triage_reason = "High risk but low confidence - LLM verification needed"
-        
-        elif fusion_result["risk_score"] <= self.CONFIDENT_SAFE:
-            # Low risk - but check confidence
-            if fusion_result["confidence"] == "HIGH":
-                # Confident safe - skip LLM
-                result["verdict"] = "SAFE"
-                triage_reason = "Confident safe (risk <= 20, confidence HIGH) - LLM not needed"
-            else:
-                # Low/medium confidence safe - VERIFY WITH LLM (might miss attacks!)
-                use_llm = True
-                triage_reason = "Low risk but low confidence - LLM verification to catch false negatives"
-        
+
+        if fusion_result["risk_score"] >= self.CONFIDENT_BLOCK and fusion_result["confidence"] == "HIGH":
+            # Confident block - skip LLM (clearly malicious; blocking errs safe)
+            result["verdict"] = "BLOCKED"
+            triage_reason = "Confident block (risk >= 85, confidence HIGH) - LLM not needed"
         else:
-            # Uncertain range (20-85) - always use LLM
+            # Everything else - LLM has the final say, including safe-looking prompts
             use_llm = True
-            triage_reason = "Uncertain case (20 < risk < 85) - LLM consulted"
-        
+            if fusion_result["risk_score"] >= self.CONFIDENT_BLOCK:
+                triage_reason = "High risk but low confidence - LLM verification needed"
+            elif fusion_result["risk_score"] <= self.CONFIDENT_SAFE:
+                triage_reason = "Low risk - LLM final verification (safe-looking can hide attacks)"
+            else:
+                triage_reason = "Uncertain case (20 < risk < 85) - LLM consulted"
         # Execute LLM decision
         if use_llm:
             if self.llm_judge:
