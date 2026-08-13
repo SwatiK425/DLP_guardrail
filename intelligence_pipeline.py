@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 
 # Optional imports with graceful degradation
 try:
@@ -158,6 +159,45 @@ def weekly_sample(df: Any, n: int, source: str, today: Optional[date] = None):
     return df.sample(n=n, random_state=seed)
 
 
+# Controlled category vocabulary. Only categories in GATE_CATEGORIES are
+# scored against the StratifiedBenchmark per-category targets; everything else
+# is an honest, non-gate bucket that still shows up in the breakdown + overall.
+GATE_CATEGORIES = {
+    "benign_code", "benign_ops", "benign_education",   # benign gates
+    "injection", "jailbreak", "kill_switch", "exfiltration", "encoding",  # attack gates
+}
+NON_GATE_CATEGORIES = {"benign_content", "harmful_content"}
+CONTROLLED_CATEGORIES = GATE_CATEGORIES | NON_GATE_CATEGORIES
+
+# Per-source normalization: (benign_category, harmful_category) in the
+# controlled vocab. Only sources whose data genuinely represents the
+# guardrail's threat model map to a GATE category (JBB -> jailbreak).
+# hh-rlhf is general chat-preference data (not the B2B threat model), so it
+# maps to honest non-gate buckets once both sides are emitted.
+SOURCE_CATEGORY_MAP = {
+    "beavertails": ("benign_education", "harmful_content"),
+    "toxic-chat": ("benign_content", "harmful_content"),
+    "jbb-behaviors": ("jailbreak", "jailbreak"),
+    "harmfulqa": ("harmful_content", "harmful_content"),
+    "hh-rlhf": ("benign_content", "harmful_content"),
+}
+BENIGN_VERDICTS = {"SAFE"}
+
+
+def normalize_category(source: str, verdict: str, raw_category: str) -> str:
+    """Map a source's raw category into the controlled vocabulary.
+
+    Known sources are resolved by (source, verdict). Unknown sources pass
+    through unchanged. Always returns a category within CONTROLLED_CATEGORIES
+    for known sources, so no "mixed"/"toxicity"/"attack" placeholders leak
+    into the benchmark.
+    """
+    pair = SOURCE_CATEGORY_MAP.get(str(source).lower())
+    if pair:
+        return pair[0] if verdict in BENIGN_VERDICTS else pair[1]
+    return raw_category or "unclassified"
+
+
 class HFDatasetStream:
     """Fetches and normalizes from Hugging Face datasets."""
 
@@ -225,6 +265,20 @@ class HFDatasetStream:
         samples = []
         skipped = []
         count = 0
+        src_key = ds_id.split("/")[-1].lower()
+
+        # hh-rlhf: flatten BOTH sides so the source carries real BLOCKED
+        # examples. chosen = preferred/safe -> SAFE, rejected = disliked/harmful
+        # -> BLOCKED. Reuses the generic loop + dedup + category normalization.
+        if ds_id == "Anthropic/hh-rlhf":
+            frames = []
+            for col, side_verdict in (("chosen", "SAFE"), ("rejected", "BLOCKED")):
+                sub = df[[col]].rename(columns={col: "prompt"}).copy()
+                sub["hh_side"] = col
+                frames.append(sub)
+            df = pd.concat(frames, ignore_index=True)
+            prompt_col, label_col, label_map, default_cat = (
+                "prompt", "hh_side", {"chosen": "SAFE", "rejected": "BLOCKED"}, "mixed")
 
         # Case-normalized map so key casing never defeats the lookup
         # (e.g. BeaverTails stores "True"/"False" -> .lower() -> "true"/"false").
@@ -258,10 +312,6 @@ class HFDatasetStream:
             if label_map and label_col and label_col in row:
                 raw_label = str(row[label_col]).lower()
                 verdict = normalized_map.get(raw_label, "SAFE" if "benign" in raw_label or "safe" in raw_label else "BLOCKED")
-            elif ds_id == "Anthropic/hh-rlhf":
-                # Anthropic HH-RLHF: use 'chosen' column (safe) as SAFE, we'd need 'rejected' for BLOCKED
-                # For now, sample from chosen = SAFE
-                verdict = "SAFE"
             elif ds_id == "declare-lab/HarmfulQA":
                 # All harmful
                 verdict = "BLOCKED"
@@ -292,8 +342,8 @@ class HFDatasetStream:
             sample = CrowdSample(
                 prompt=prompt,
                 verdict=verdict,
-                category=category,
-                source=ds_id.split("/")[-1].lower(),
+                category=normalize_category(src_key, verdict, category),
+                source=src_key,
                 source_id=f"{ds_id}:{idx}",
                 metadata={"original_label": str(row.get(label_col, ""))},
                 embedding=emb,
