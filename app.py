@@ -169,21 +169,51 @@ def analyze_individual(prompt: str) -> tuple:
     </div>
     """
     
-    # Format layers
-    layers_html = "<div style='font-family: monospace; font-size: 14px;'>"
-    layers_html += "<h3>📊 Layer Breakdown</h3>"
+    # Format layers (reasoning in hover tooltips — clean UI)
+    def _tip(lines, color):
+        if not lines:
+            return ""
+        inner = "".join(f"<div style='margin:2px 0;'>{l}</div>" for l in lines)
+        return (
+            f"<span class='dlp-tip' style='color:{color};'>ⓘ"
+            f"<span class='dlp-tip-text'>{inner}</span></span>"
+        )
+
+    layers_html = """
+    <style>
+      .dlp-tip{position:relative;cursor:help;margin-left:6px;font-size:13px;}
+      .dlp-tip .dlp-tip-text{display:none;position:absolute;bottom:130%;left:0;z-index:100;
+        width:max-content;max-width:360px;background:#ffffff;color:#000;
+        font-size:12px;line-height:1.5;padding:8px 10px;border-radius:6px;
+        border:1px solid #ccc;box-shadow:0 2px 8px rgba(0,0,0,.35);
+        white-space:normal;text-align:left;}
+      .dlp-tip .dlp-tip-text div{color:#000;}
+      .dlp-tip:hover .dlp-tip-text{display:block;}
+    </style>
+    <div style='font-family: monospace; font-size: 14px;'>
+    <h3>📊 Layer Breakdown</h3>
+    """
     for layer in result["layers"]:
         risk = layer["risk"]
         bar_color = "#44ff44" if risk < 40 else "#ffbb00" if risk < 70 else "#ff4444"
         layers_html += f"""
         <div style="margin: 10px 0; padding: 10px; background: #f9f9f9; border-radius: 5px;">
-            <b>{layer["name"]}</b>: {risk}/100<br>
+            <b>{layer["name"]}</b>: {risk}/100{_tip(layer.get("reasoning", []), bar_color)}<br>
             <div style="background: #ddd; height: 20px; border-radius: 10px; margin-top: 5px;">
                 <div style="background: {bar_color}; width: {risk}%; height: 100%; border-radius: 10px;"></div>
             </div>
             <small style="color: #666;">{layer["details"]}</small>
         </div>
         """
+
+    if result.get("layer_reasoning"):
+        fusion = result['layer_reasoning'].get('fusion', 'n/a')
+        triage = result['layer_reasoning'].get('triage', 'n/a')
+        layers_html += (
+            "<div style='margin:10px 0;padding:10px;background:#f0f0f0;border-radius:5px;'>"
+            f"<b>🔗 Fusion & Triage</b>{_tip([f'Fusion: {fusion}', f'Triage: {triage}'], '#666')}"
+            "</div>"
+        )
     layers_html += "</div>"
     
     # Format LLM status

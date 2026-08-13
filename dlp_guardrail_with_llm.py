@@ -360,11 +360,19 @@ class ObfuscationDetector:
                 if "invisible_chars" not in techniques:
                     techniques.append("invisible_chars")
         
+        reasoning = []
+        if techniques:
+            reasoning.append(f"{len(techniques)} technique(s) applied: {', '.join(techniques)}")
+            reasoning.append(f"normalized: {normalized[:80]!r}")
+        else:
+            reasoning.append("no obfuscation detected -> risk 0")
+
         return {
             "normalized": normalized,
             "obfuscation_detected": len(techniques) > 0,
             "techniques": techniques,
-            "original": text
+            "original": text,
+            "reasoning": reasoning,
         }
 
 
@@ -429,13 +437,14 @@ class BehavioralAnalyzer:
 
     def analyze(self, prompt: str) -> Dict:
         behaviors_detected = []
+        matched_patterns = {}
 
         for category, patterns_dict in self.behavioral_patterns.items():
             for behavior_name, patterns in patterns_dict.items():
-                matched = False
+                matched = None
                 for pattern in patterns:
                     if re.search(pattern, prompt):
-                        matched = True
+                        matched = pattern
                         break
 
                 if matched:
@@ -443,6 +452,7 @@ class BehavioralAnalyzer:
                         "category": category,
                         "behavior": behavior_name
                     })
+                    matched_patterns[behavior_name] = matched
 
         names = {b["behavior"] for b in behaviors_detected}
         has_training = "training_references" in names
@@ -457,38 +467,70 @@ class BehavioralAnalyzer:
         target = bool(self.target_re.search(lower))
 
         # ---- Intent-based scoring (not bare-keyword) ----
+        # Each branch records WHY it fired so the verdict is auditable.
         risk_score = 0
+        branch = "no intent signal matched -> risk 0"
         # 1. Hardest intent: expose the system/base prompt
         if has_disclosure:
             risk_score = 88
+            branch = "disclosure intent ('system/base prompt' request) -> 88"
         # 2. Jailbreak overlaid with a high-risk signal
         elif has_jailbreak and (has_role or has_unfiltered or has_disclosure or retrieval):
             risk_score = 90
+            branch = "jailbreak + overlay signal (role/unfiltered/disclosure/retrieval) -> 90"
         # 3. Role takeover that reaches for data/access
         elif has_role and (retrieval or target or has_disclosure):
             risk_score = 78
+            branch = "role takeover reaching for data/access -> 78"
         elif has_jailbreak:
             risk_score = 72
+            branch = "bare jailbreak intent -> 72"
         # 4. Sensitive data reachable via retrieval intent (real exfil)
         elif retrieval and target:
             if any(w in lower for w in ("credit card", "ssn", "social security",
                                         "dataset", "training data", "memorized",
                                         "passport", "email", "financial")):
                 risk_score = 85
+                branch = "retrieval intent + strong sensitive target -> 85"
             else:
                 risk_score = 65
+                branch = "retrieval intent + weak sensitive target -> 65"
         # 5. Unfiltered + retrieval (dump raw output)
         elif has_unfiltered and (retrieval or target):
             risk_score = 70
+            branch = "unfiltered request + retrieval/target -> 70"
 
         # Bare sensitive target with NO retrieval intent -> benign
         if not retrieval and not has_role and not has_disclosure and not has_jailbreak:
             risk_score = 0
+            branch = "benign override: sensitive word present but no retrieval/role/disclosure/jailbreak intent -> 0"
+
+        reasoning = []
+        if matched_patterns:
+            for b in behaviors_detected:
+                reasoning.append(
+                    f"behavior '{b['behavior']}' ({b['category']}) matched pattern: {matched_patterns[b['behavior']]}"
+                )
+        else:
+            reasoning.append("no behavioral pattern matched")
+        reasoning.append(
+            f"intent signals: retrieval={retrieval} target={target} "
+            f"training={has_training} pii={has_pii} unfiltered={has_unfiltered} "
+            f"jailbreak={has_jailbreak} role={has_role} disclosure={has_disclosure}"
+        )
+        reasoning.append(f"scoring branch: {branch}")
 
         return {
             "risk_score": risk_score,
             "behaviors_detected": behaviors_detected,
             "has_combination": has_training and (has_pii or has_unfiltered),
+            "matched_patterns": matched_patterns,
+            "intent_signals": {
+                "retrieval": retrieval, "target": target,
+                "training": has_training, "pii": has_pii, "unfiltered": has_unfiltered,
+                "jailbreak": has_jailbreak, "role": has_role, "disclosure": has_disclosure,
+            },
+            "reasoning": reasoning,
         }
 
 
@@ -567,11 +609,25 @@ class IntentBasedSemanticAnalyzer:
                 max_risk = max(max_risk, rule["risk"])
         
         confidence = self._compute_confidence(intent_scores)
+
+        reasoning = []
+        for dim, scores in intent_scores.items():
+            top = sorted(scores.items(), key=lambda kv: -kv[1])[:2]
+            reasoning.append(
+                f"{dim}: " + ", ".join(f"{k}={v:.3f}" for k, v in top)
+            )
+        if triggered_rules:
+            for r in triggered_rules:
+                reasoning.append(f"triggered rule '{r['name']}' (risk {r['risk']}, thresholds {r['min_scores']})")
+        else:
+            reasoning.append("no rule crossed its similarity threshold")
         
         return {
             "risk_score": max_risk if triggered_rules else self._compute_baseline_risk(intent_scores),
             "confidence": confidence,
             "triggered_rules": [r["name"] for r in triggered_rules],
+            "intent_scores": intent_scores,
+            "reasoning": reasoning,
         }
     
     def _check_rule(self, rule: Dict, intent_scores: Dict) -> bool:
@@ -618,13 +674,18 @@ class IntentBasedSemanticAnalyzer:
         
         has_training = any(word in prompt_lower for word in ["training", "learned", "memorized"])
         has_pii = any(word in prompt_lower for word in ["credit card", "ssn"])
-        
+
+        reasoning = ["fallback keyword analysis (fastembed unavailable)"]
         if has_training and has_pii:
             risk = 90
+            reasoning.append("keyword combo training + pii -> 90")
         elif has_training:
             risk = 55
+            reasoning.append("keyword 'training/learned/memorized' present -> 55")
+        else:
+            reasoning.append("no keyword hit -> 0")
         
-        return {"risk_score": risk, "confidence": 0.6, "triggered_rules": []}
+        return {"risk_score": risk, "confidence": 0.6, "triggered_rules": [], "reasoning": reasoning}
 
 
 class IntentAwareTransformerDetector:
@@ -648,22 +709,36 @@ class IntentAwareTransformerDetector:
             self.has_transformer = False
     
     def analyze(self, prompt: str) -> Dict:
+        source = "fallback keyword counter"
         if self.has_transformer:
             try:
                 pred = self.injection_detector(prompt, truncation=True, max_length=512)[0]
                 is_injection = pred["label"] == "INJECTION"
                 injection_conf = pred["score"]
+                source = "deberta-v3-injection model"
             except:
                 is_injection, injection_conf = self._fallback(prompt)
         else:
             is_injection, injection_conf = self._fallback(prompt)
         
         risk_score = 80 if (is_injection and injection_conf > 0.8) else 60 if is_injection else 0
+
+        reasoning = [
+            f"source: {source}",
+            f"is_injection={is_injection} confidence={injection_conf:.3f}",
+        ]
+        if is_injection and injection_conf > 0.8:
+            reasoning.append("injection detected with confidence > 0.8 -> 80")
+        elif is_injection:
+            reasoning.append("injection detected but confidence <= 0.8 -> 60")
+        else:
+            reasoning.append("not classified as injection -> 0")
         
         return {
             "is_injection": is_injection,
             "injection_confidence": injection_conf,
             "risk_score": risk_score,
+            "reasoning": reasoning,
         }
     
     def _fallback(self, prompt: str) -> Tuple[bool, float]:
@@ -811,7 +886,10 @@ class IntentGuardrailWithLLM:
         result["layers"].append({
             "name": "Layer 0: Obfuscation",
             "risk": obfuscation_risk,
-            "details": ", ".join(obfuscation_result["techniques"]) or "Clean"
+            "details": ", ".join(obfuscation_result["techniques"]) or "Clean",
+            "reasoning": (["normalized text: " + normalized_prompt[:80]]
+                          + [f"technique: {t}" for t in obfuscation_result["techniques"]]
+                          or ["no obfuscation detected -> risk 0"])
         })
         
         # Layer 1: Behavioral
@@ -819,7 +897,8 @@ class IntentGuardrailWithLLM:
         result["layers"].append({
             "name": "Layer 1: Behavioral",
             "risk": behavioral_result["risk_score"],
-            "details": f"{len(behavioral_result['behaviors_detected'])} behaviors detected"
+            "details": f"{len(behavioral_result['behaviors_detected'])} behaviors detected",
+            "reasoning": behavioral_result["reasoning"]
         })
         
         # Early block if very confident
@@ -828,7 +907,15 @@ class IntentGuardrailWithLLM:
             result["verdict"] = "BLOCKED"
             result["confidence"] = "HIGH"
             result["llm_status"]["reason"] = "Confident block - LLM not needed"
+            result["layer_reasoning"] = {
+                "layer0": obfuscation_result["reasoning"],
+                "layer1": behavioral_result["reasoning"],
+                "fusion": "skipped (early confident block, no fusion needed)",
+                "triage": "behavioral risk >= 85 -> confident BLOCK, LLM skipped"
+            }
             result["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
+            if verbose:
+                self._print_analysis(result)
             return result
         
         # Layer 2: Semantic
@@ -836,7 +923,8 @@ class IntentGuardrailWithLLM:
         result["layers"].append({
             "name": "Layer 2: Intent-Based Semantic",
             "risk": semantic_result["risk_score"],
-            "details": f"Rules: {len(semantic_result['triggered_rules'])}"
+            "details": f"Rules: {len(semantic_result['triggered_rules'])}",
+            "reasoning": semantic_result["reasoning"]
         })
         
         # Layer 3: Transformer
@@ -844,7 +932,8 @@ class IntentGuardrailWithLLM:
         result["layers"].append({
             "name": "Layer 3: Transformer",
             "risk": transformer_result["risk_score"],
-            "details": f"Injection: {transformer_result['is_injection']}"
+            "details": f"Injection: {transformer_result['is_injection']}",
+            "reasoning": transformer_result["reasoning"]
         })
         
         # Fusion
@@ -907,6 +996,16 @@ class IntentGuardrailWithLLM:
             # Skip LLM
             result["llm_status"]["reason"] = triage_reason
         
+        result["layer_reasoning"] = {
+            "layer0": obfuscation_result["reasoning"],
+            "layer1": behavioral_result["reasoning"],
+            "layer2": semantic_result["reasoning"],
+            "layer3": transformer_result["reasoning"],
+            "fusion": fusion_result["reasoning"],
+            "triage": f"risk={fusion_result['risk_score']} conf={fusion_result['confidence']} -> "
+                      f"use_llm={use_llm} ({triage_reason})",
+        }
+        
         result["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
         
         if verbose:
@@ -934,15 +1033,20 @@ class IntentGuardrailWithLLM:
         engaged = [(r, c) for r, c in signals if r > 0]
 
         if not engaged:
-            return {"risk_score": 0, "confidence": "HIGH"}
+            return {"risk_score": 0, "confidence": "HIGH",
+                    "reasoning": "all layers silent (risk 0) -> abstain, SAFE"}
 
         # Any confidently-high signal stands on its own (do not average it down).
         max_confident = max((r for r, c in engaged if c > 0.8), default=0)
         if max_confident >= 70:
             # Escalate: confidently-detected risk is authoritative.
-            return {"risk_score": max_confident, "confidence": "HIGH"}
+            return {"risk_score": max_confident, "confidence": "HIGH",
+                    "reasoning": (f"escalate: confident signal (conf>0.8) risk "
+                                  f"{max_confident} >= 70 stands alone, HIGH")}
         if max_confident >= 40:
-            return {"risk_score": max_confident, "confidence": "MEDIUM"}
+            return {"risk_score": max_confident, "confidence": "MEDIUM",
+                    "reasoning": (f"escalate: confident signal (conf>0.8) risk "
+                                  f"{max_confident} in [40,70), MEDIUM")}
 
         # Otherwise weight-average only the engaged (non-zero) signals.
         total_weight = sum(c for _, c in engaged)
@@ -954,7 +1058,10 @@ class IntentGuardrailWithLLM:
         risks = [r for r, _ in engaged]
         agreement = (max(risks) - min(risks)) < 25
         conf = "HIGH" if agreement else "MEDIUM"
-        return {"risk_score": int(weighted), "confidence": conf}
+        engaged_str = ", ".join(f"risk={r}@conf={c:.2f}" for r, c in engaged)
+        return {"risk_score": int(weighted), "confidence": conf,
+                "reasoning": (f"weight-average engaged signals [{engaged_str}] "
+                              f"-> {int(weighted)}, agreement={'yes' if agreement else 'no'} -> {conf}")}
     
     def _score_to_verdict(self, risk_score: int) -> str:
         if risk_score >= 80:
@@ -990,6 +1097,14 @@ class IntentGuardrailWithLLM:
         for layer in result['layers']:
             print(f"   • {layer['name']}: {layer['risk']}/100")
             print(f"     {layer['details']}")
+            for line in layer.get("reasoning", []):
+                print(f"       - {line}")
+
+        if result.get("layer_reasoning"):
+            print(f"\n🔗 FUSION:")
+            print(f"   {result['layer_reasoning'].get('fusion', 'n/a')}")
+            print(f"\n🚦 TRIAGE:")
+            print(f"   {result['layer_reasoning'].get('triage', 'n/a')}")
         
         if "llm_reasoning" in result:
             print(f"\n💭 LLM REASONING:")
