@@ -22,7 +22,7 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -139,6 +139,25 @@ class EmbeddingEngine:
 # STREAM 1: ACADEMIC HF DATASETS
 # ============================================================================
 
+def weekly_sample(df: Any, n: int, source: str, today: Optional[date] = None):
+    """Deterministic, capped, weekly-rotating row selection.
+
+    Replaces `df.head(n)`, which re-collects the SAME first-n rows on every
+    run forever. Instead we seed on (source, ISO week):
+      - reproducible for a given week (same seed -> same rows),
+      - rotates coverage across weeks, so a continuous loop accumulates
+        different regions of large datasets over time,
+      - never returns more than `n` rows.
+    Falls back to the whole frame if it has <= n rows.
+    """
+    today = today or date.today()
+    iso_year, iso_week, _ = today.isocalendar()
+    seed = int(hashlib.sha256(f"{source}:{iso_year}-W{iso_week}".encode()).hexdigest()[:8], 16)
+    if not hasattr(df, "sample") or len(df) <= n:
+        return df
+    return df.sample(n=n, random_state=seed)
+
+
 class HFDatasetStream:
     """Fetches and normalizes from Hugging Face datasets."""
 
@@ -211,11 +230,15 @@ class HFDatasetStream:
         # (e.g. BeaverTails stores "True"/"False" -> .lower() -> "true"/"false").
         normalized_map = {k.lower(): v for k, v in label_map.items()} if label_map else {}
 
+        # Weekly-rotating, capped sample so coverage spreads over time instead
+        # of permanently living in the first max_per_dataset rows.
+        sampled = weekly_sample(df, self.max_per_dataset, ds_id)
+
         # Batch embed for efficiency
-        prompts = df[prompt_col].astype(str).tolist()[:self.max_per_dataset]
+        prompts = sampled[prompt_col].astype(str).tolist()
         embeddings = self.embedding_engine.embed(prompts)
 
-        for idx, (_, row) in enumerate(df.head(self.max_per_dataset).iterrows()):
+        for idx, (_, row) in enumerate(sampled.iterrows()):
             prompt = str(row[prompt_col]).strip()
             if not prompt or len(prompt) < 5:
                 skipped.append(f"{ds_id}[{idx}]: empty/short prompt")
@@ -716,6 +739,7 @@ class IntelligencePipeline:
         return {
             "total_collected": len(all_samples),
             "by_source": self._count_by_source(all_samples),
+            "label_breakdown": summarize_labels(all_samples),
             "disagreements": len(disagreements),
             "skipped_count": len(all_skipped),
             "skipped_details": all_skipped[:20],
@@ -816,6 +840,29 @@ class IntelligencePipeline:
         for s in samples:
             counts[s.source] = counts.get(s.source, 0) + 1
         return counts
+
+
+def summarize_labels(samples: List[CrowdSample]) -> Dict[str, Any]:
+    """Per-source ground-truth verdict distribution + per-category counts.
+
+    Purpose: make a degenerate stream visible. A source that emits only SAFE
+    (e.g. hh-rlhf, chosen-only) or only BLOCKED (pre-fix BeaverTails) is a
+    red flag that the ground truth is uninformative — indistinguishable from
+    healthy at the old "+N samples" level.
+    """
+    by_source: Dict[str, Dict[str, int]] = {}
+    by_category: Dict[str, int] = {}
+    for s in samples:
+        src = s.source
+        vs = by_source.setdefault(src, {})
+        vs[s.verdict] = vs.get(s.verdict, 0) + 1
+        by_category[s.category] = by_category.get(s.category, 0) + 1
+    return {
+        "total": len(samples),
+        "count_by_source": {k: sum(v.values()) for k, v in by_source.items()},
+        "verdicts_by_source": by_source,
+        "categories": dict(sorted(by_category.items(), key=lambda kv: -kv[1])),
+    }
 
 
 # ============================================================================
@@ -923,6 +970,20 @@ def run_weekly_pipeline():
     print("\n📊 COLLECTION STATS:")
     print(f"  Total new samples: {stats['total_collected']}")
     print(f"  By source: {stats['by_source']}")
+
+    breakdown = stats.get("label_breakdown", {})
+    print("  Ground-truth verdicts by source (stream health):")
+    for src, vs in breakdown.get("verdicts_by_source", {}).items():
+        parts = "  ".join(f"{v}={n}" for v, n in sorted(vs.items()))
+        print(f"    {src:20s} {parts}")
+    # Flag degenerate sources: those with zero output class diversity.
+    for src, vs in breakdown.get("verdicts_by_source", {}).items():
+        if len(vs) < 2:
+            print(f"    ⚠️ {src} emits a single class ({list(vs.items())}) - ground truth likely uninformative")
+    if breakdown.get("categories"):
+        top = ", ".join(f"{c}={n}" for c, n in list(breakdown["categories"].items())[:8])
+        print(f"  Top categories (this run): {top}")
+
     print(f"  Disagreements flagged: {stats['disagreements']}")
     print(f"  Skipped (dedup/errors): {stats['skipped_count']}")
 
