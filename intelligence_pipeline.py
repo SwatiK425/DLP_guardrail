@@ -206,6 +206,10 @@ class HFDatasetStream:
         skipped = []
         count = 0
 
+        # Case-normalized map so key casing never defeats the lookup
+        # (e.g. BeaverTails stores "True"/"False" -> .lower() -> "true"/"false").
+        normalized_map = {k.lower(): v for k, v in label_map.items()} if label_map else {}
+
         # Batch embed for efficiency
         prompts = df[prompt_col].astype(str).tolist()[:self.max_per_dataset]
         embeddings = self.embedding_engine.embed(prompts)
@@ -229,7 +233,7 @@ class HFDatasetStream:
             # Determine verdict
             if label_map and label_col and label_col in row:
                 raw_label = str(row[label_col]).lower()
-                verdict = label_map.get(raw_label, "SAFE" if "benign" in raw_label or "safe" in raw_label else "BLOCKED")
+                verdict = normalized_map.get(raw_label, "SAFE" if "benign" in raw_label or "safe" in raw_label else "BLOCKED")
             elif ds_id == "Anthropic/hh-rlhf":
                 # Anthropic HH-RLHF: use 'chosen' column (safe) as SAFE, we'd need 'rejected' for BLOCKED
                 # For now, sample from chosen = SAFE
