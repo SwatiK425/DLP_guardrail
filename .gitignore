@@ -46,3 +46,8 @@ SYSTEM_DESIGN.md
 My notes.txt
 eval_dataset_v2.csv
 probe_layers.py
+eval_paraphrases.py
+memorization_check.py
+eval_splits.py
+eval_train.csv
+eval_test.csv
