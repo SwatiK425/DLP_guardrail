@@ -14,6 +14,7 @@ Key mechanics:
 """
 import json
 import hashlib
+import importlib.util
 import os
 import re
 import subprocess
@@ -287,6 +288,33 @@ class HFDatasetStream:
 # STREAM 2: RED-TEAMING TOOL ADAPTERS
 # ============================================================================
 
+def extract_garak_prompts(report: Any) -> List[str]:
+    """Py dumb, tolerant extractor for prompts inside a garak JSON report.
+
+    Recursively walks the report and collects any string under a keys like
+    "prompt"/"prompts"/"prompt_text"/"prompt_code". Returns [] on malformed
+    input so the caller can silently fall back to curated seeds.
+    """
+    found: List[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(k, str) and "prompt" in k.lower() and isinstance(v, str) and v.strip():
+                    found.append(v.strip())
+                else:
+                    walk(v)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    try:
+        walk(report)
+    except Exception:
+        return []
+    return list(dict.fromkeys(found))
+
+
 class GarakAdapter:
     """Run Garak probes programmatically, capture attack prompts."""
 
@@ -306,57 +334,94 @@ class GarakAdapter:
         "manipulation.EmotionalAppeal",
     ]
 
-    def __init__(self, embedding_engine: EmbeddingEngine, max_per_probe: int = 50):
+    def __init__(self, embedding_engine: EmbeddingEngine, max_per_probe: int = 50,
+                 time_budget_seconds: int = 120):
         self.embedding_engine = embedding_engine
         self.max_per_probe = max_per_probe
+        self.time_budget_seconds = time_budget_seconds
+
+    @staticmethod
+    def _garak_available() -> bool:
+        """True only if `garak` is importable, so we never burn a subprocess on air."""
+        return importlib.util.find_spec("garak") is not None
 
     def generate_attacks(self, existing_fps: set, existing_embs: List[np.ndarray]) -> Tuple[List[CrowdSample], List[str]]:
-        """Run Garak locally, extract attack prompts."""
+        """Run Garak probes when available, else curated red-team seeds."""
         samples = []
         skipped = []
 
-        for probe in self.PROBES:
-            try:
-                # Run garak as module: python -m garak --probes <probe> --generations <n>
-                # Capture the generated prompts from garak's output
-                result = subprocess.run(
-                    [sys.executable, "-m", "garak", "--probes", probe, "--generations", str(self.max_per_probe)],
-                    capture_output=True, text=True, timeout=300
-                )
+        deadline = time.monotonic() + self.time_budget_seconds
+        garak_ok = self._garak_available()
+        if not garak_ok:
+            skipped.append("garak not installed; using curated red-team seeds")
 
-                # Parse garak output for generated prompts
-                # Garak logs to stdout; we'd need to hook its generator or parse logs
-                # For now, use known probe patterns
+        for probe in self.PROBES:
+            if time.monotonic() > deadline:
+                skipped.append("time budget exceeded; stopped collecting")
+                break
+
+            prompts = []
+            if garak_ok:
+                try:
+                    prompts = self._run_garak_probe(probe)
+                except Exception as e:
+                    skipped.append(f"garak {probe}: {e}; using curated seeds")
+                if not prompts:
+                    prompts = self._get_probe_prompts(probe)
+            else:
                 prompts = self._get_probe_prompts(probe)
 
-                for i, prompt in enumerate(prompts):
-                    fp = hashlib.sha256(f"garak:{probe}:{prompt}".encode()).hexdigest()[:16]
-                    if fp in existing_fps:
-                        continue
-                    emb = self.embedding_engine.embed_one(prompt)
-                    if self.embedding_engine.is_duplicate(emb, existing_embs):
-                        continue
+            for i, prompt in enumerate(prompts):
+                fp = hashlib.sha256(f"garak:{probe}:{prompt}".encode()).hexdigest()[:16]
+                if fp in existing_fps:
+                    continue
+                emb = self.embedding_engine.embed_one(prompt)
+                if self.embedding_engine.is_duplicate(emb, existing_embs):
+                    continue
 
-                    sample = CrowdSample(
-                        prompt=prompt,
-                        verdict="BLOCKED",
-                        category=probe.split(".")[0],  # "encoding", "exploitation", etc.
-                        source="garak",
-                        source_id=f"{probe}:{i}",
-                        metadata={"probe": probe},
-                        embedding=emb,
-                    )
-                    samples.append(sample)
-                    existing_fps.add(fp)
-                    existing_embs.append(emb)
-
-            except FileNotFoundError:
-                skipped.append("garak not installed (pip install garak)")
-                break
-            except Exception as e:
-                skipped.append(f"garak {probe}: {e}")
+                sample = CrowdSample(
+                    prompt=prompt,
+                    verdict="BLOCKED",
+                    category=probe.split(".")[0],  # "encoding", "exploitation", etc.
+                    source="garak",
+                    source_id=f"{probe}:{i}",
+                    metadata={"probe": probe},
+                    embedding=emb,
+                )
+                samples.append(sample)
+                existing_fps.add(fp)
+                existing_embs.append(emb)
 
         return samples, skipped
+
+    def _run_garak_probe(self, probe: str) -> List[str]:
+        """Run one garak probe and parse generated prompts from its JSON report.
+
+        Returns [] if no prompts could be extracted (caller falls back to seeds).
+        The exact report field names are confirmed against the installed garak
+        version; see extract_garak_prompts for the tolerated shapes.
+        """
+        import tempfile
+        report_prefix = os.path.join(tempfile.gettempdir(), f"garak_{abs(hash(probe))}")
+        remaining = self.time_budget_seconds
+        probe_timeout = min(300, max(15, remaining))
+
+        result = subprocess.run(
+            [sys.executable, "-m", "garak", "--probes", probe, "--generations", str(self.max_per_probe),
+             "--report_prefix", report_prefix],
+            capture_output=True, text=True, timeout=probe_timeout,
+        )
+
+        # Garak writes several report artifacts (e.g. <prefix>.report.jsonl).
+        candidates = sorted(Path(report_prefix).parent.glob(f"{Path(report_prefix).name}*.json*"))
+        prompts = []
+        for path in candidates:
+            try:
+                with open(path) as f:
+                    prompts.extend(extract_garak_prompts(json.load(f)))
+            except Exception:
+                continue
+        return list(dict.fromkeys(prompts))  # dedup, preserve order
 
     def _get_probe_prompts(self, probe: str) -> List[str]:
         """Fallback: known attack patterns per probe when garak unavailable."""
