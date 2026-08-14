@@ -15,6 +15,7 @@ Key mechanics:
 import json
 import hashlib
 import importlib.util
+import csv
 import os
 import re
 import subprocess
@@ -28,6 +29,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+# Windows consoles default to cp1252, which cannot print emoji and raises a
+# UnicodeEncodeError that kills the CLI. Force UTF-8 output regardless of
+# locale so this runs from cmd / PowerShell.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
 
 # Optional imports with graceful degradation
 try:
@@ -162,24 +172,25 @@ def weekly_sample(df: Any, n: int, source: str, today: Optional[date] = None):
 # Controlled category vocabulary. Only categories in GATE_CATEGORIES are
 # scored against the StratifiedBenchmark per-category targets; everything else
 # is an honest, non-gate bucket that still shows up in the breakdown + overall.
+#
+# SCOPE: adversarial security ONLY. GATE_CATEGORIES contains the deterministic
+# attack gates (injection, jailbreak, kill_switch, exfiltration, encoding) and
+# the benign business gates that must never over-block (benign_ops/code/education).
+# General content-safety buckets (harmful_content, benign_content) are DELIBERATELY
+# absent: subjective moderation is out of scope for this product.
 GATE_CATEGORIES = {
     "benign_code", "benign_ops", "benign_education",   # benign gates
     "injection", "jailbreak", "kill_switch", "exfiltration", "encoding",  # attack gates
 }
-NON_GATE_CATEGORIES = {"benign_content", "harmful_content"}
+NON_GATE_CATEGORIES = set()
 CONTROLLED_CATEGORIES = GATE_CATEGORIES | NON_GATE_CATEGORIES
 
 # Per-source normalization: (benign_category, harmful_category) in the
 # controlled vocab. Only sources whose data genuinely represents the
-# guardrail's threat model map to a GATE category (JBB -> jailbreak).
-# hh-rlhf is general chat-preference data (not the B2B threat model), so it
-# maps to honest non-gate buckets once both sides are emitted.
+# guardrail's threat model map to a GATE category.
 SOURCE_CATEGORY_MAP = {
-    "beavertails": ("benign_education", "harmful_content"),
-    "toxic-chat": ("benign_content", "harmful_content"),
     "jbb-behaviors": ("jailbreak", "jailbreak"),
-    "harmfulqa": ("harmful_content", "harmful_content"),
-    "hh-rlhf": ("benign_content", "harmful_content"),
+    "benign-business": ("benign_ops", "benign_ops"),
 }
 BENIGN_VERDICTS = {"SAFE"}
 
@@ -191,7 +202,13 @@ def normalize_category(source: str, verdict: str, raw_category: str) -> str:
     through unchanged. Always returns a category within CONTROLLED_CATEGORIES
     for known sources, so no "mixed"/"toxicity"/"attack" placeholders leak
     into the benchmark.
+
+    The curated benign source carries an explicit category
+    (benign_ops/benign_code/benign_education), so its raw category passes
+    through as long as it is a valid gate category.
     """
+    if str(source).lower() == "benign-business":
+        return raw_category if raw_category in GATE_CATEGORIES else "benign_ops"
     pair = SOURCE_CATEGORY_MAP.get(str(source).lower())
     if pair:
         return pair[0] if verdict in BENIGN_VERDICTS else pair[1]
@@ -202,33 +219,14 @@ class HFDatasetStream:
     """Fetches and normalizes from Hugging Face datasets."""
 
     # Curated dataset configs: (dataset_id, config, split, prompt_col, label_col, label_map, category_default)
+    #
+    # SCOPE: adversarial security ONLY (injection, jailbreak, kill-switch,
+    # exfiltration, encoding). General content-safety datasets (BeaverTails,
+    # ToxicChat, hh-rlhf, HarmfulQA) are deliberately EXCLUDED - their
+    # "harmful" labels are subjective moderation, not deterministic attacks.
     DATASETS = [
-        # BeaverTails (PKU-Alignment/SafeRLHF related) - has is_safe label
-        ("PKU-Alignment/BeaverTails", "default", "30k_train", "prompt", "is_safe", {
-            "True": "SAFE",
-            "False": "BLOCKED",
-        }, "mixed"),
-
-        # Anthropic HH-RLHF: human preference data (chosen=safe, rejected=harmful)
-        ("Anthropic/hh-rlhf", None, "train", "chosen", None, None, "mixed"),  # Special: both chosen/rejected
-
-        # JailbreakBench JBB-Behaviors - uses 'Goal' column and category is a dict
+        # JailbreakBench JBB-Behaviors - deterministic jailbreak goals
         ("JailbreakBench/JBB-Behaviors", "behaviors", "harmful", "Goal", None, None, "jailbreak"),
-
-        # ToxicChat
-        ("lmsys/toxic-chat", "toxicchat0124", "train", "user_input", "toxicity", {
-            "0": "SAFE",
-            "1": "BLOCKED",
-        }, "toxicity"),
-
-        # HarmfulQA - all harmful
-        ("declare-lab/HarmfulQA", None, "train", "question", None, None, "attack"),  # All harmful
-
-        # BeaverTails 330k (larger) - use default config
-        ("PKU-Alignment/BeaverTails", "default", "330k_train", "prompt", "is_safe", {
-            "True": "SAFE",
-            "False": "BLOCKED",
-        }, "mixed"),
     ]
 
     def __init__(self, embedding_engine: EmbeddingEngine, max_per_dataset: int = 2000):
@@ -267,21 +265,8 @@ class HFDatasetStream:
         count = 0
         src_key = ds_id.split("/")[-1].lower()
 
-        # hh-rlhf: flatten BOTH sides so the source carries real BLOCKED
-        # examples. chosen = preferred/safe -> SAFE, rejected = disliked/harmful
-        # -> BLOCKED. Reuses the generic loop + dedup + category normalization.
-        if ds_id == "Anthropic/hh-rlhf":
-            frames = []
-            for col, side_verdict in (("chosen", "SAFE"), ("rejected", "BLOCKED")):
-                sub = df[[col]].rename(columns={col: "prompt"}).copy()
-                sub["hh_side"] = col
-                frames.append(sub)
-            df = pd.concat(frames, ignore_index=True)
-            prompt_col, label_col, label_map, default_cat = (
-                "prompt", "hh_side", {"chosen": "SAFE", "rejected": "BLOCKED"}, "mixed")
-
         # Case-normalized map so key casing never defeats the lookup
-        # (e.g. BeaverTails stores "True"/"False" -> .lower() -> "true"/"false").
+        # (the label keys handed to _fetch_one are already the downstream ones).
         normalized_map = {k.lower(): v for k, v in label_map.items()} if label_map else {}
 
         # Weekly-rotating, capped sample so coverage spreads over time instead
@@ -312,9 +297,6 @@ class HFDatasetStream:
             if label_map and label_col and label_col in row:
                 raw_label = str(row[label_col]).lower()
                 verdict = normalized_map.get(raw_label, "SAFE" if "benign" in raw_label or "safe" in raw_label else "BLOCKED")
-            elif ds_id == "declare-lab/HarmfulQA":
-                # All harmful
-                verdict = "BLOCKED"
             elif ds_id == "JailbreakBench/JBB-Behaviors":
                 # JBB harmful split = all BLOCKED
                 verdict = "BLOCKED"
@@ -407,6 +389,18 @@ class GarakAdapter:
         "manipulation.EmotionalAppeal",
     ]
 
+    # Map garak probe family -> controlled GATE category so every garak
+    # sample lands in the adversarial vocab (dan/exploitation/manipulation
+    # are not vocabulary categories).
+    PROBE_CATEGORY = {
+        "dan": "jailbreak",
+        "encoding": "encoding",
+        "exploitation": "injection",
+        "exfiltration": "exfiltration",
+        "jailbreak": "jailbreak",
+        "manipulation": "jailbreak",
+    }
+
     def __init__(self, embedding_engine: EmbeddingEngine, max_per_probe: int = 50,
                  time_budget_seconds: int = 120):
         self.embedding_engine = embedding_engine
@@ -455,7 +449,7 @@ class GarakAdapter:
                 sample = CrowdSample(
                     prompt=prompt,
                     verdict="BLOCKED",
-                    category=probe.split(".")[0],  # "encoding", "exploitation", etc.
+                    category=self.PROBE_CATEGORY.get(probe.split(".")[0], "injection"),
                     source="garak",
                     source_id=f"{probe}:{i}",
                     metadata={"probe": probe},
@@ -533,28 +527,25 @@ class GarakAdapter:
 # ============================================================================
 
 class MITREAtlasStream:
-    """Parse MITRE ATLAS techniques for LLM-specific attack patterns."""
+    """Parse MITRE ATLAS techniques for LLM-specific attack patterns.
 
-    ATLAS_URL = "https://raw.githubusercontent.com/mitre/atlas/main/atlas-data/techniques/enterprise/techniques.json"
+    The atlas-data repo publishes a v6 YAML export (dist/v6/ATLAS-latest.yaml)
+    where each technique has id + name + description (no procedure_examples).
+    We generate a deterministic probe prompt per relevant technique and label it
+    with its GATE category, so MITRE is a source of adversarial ground truth.
+    """
 
-    # ATLAS techniques relevant to LLM guardrails
+    ATLAS_URL = "https://raw.githubusercontent.com/mitre-atlas/atlas-data/main/dist/v6/ATLAS-2026.07.yaml"
+
+    # ATLAS technique IDs relevant to the DLP guardrail's adversarial scope,
+    # mapped to the controlled GATE category they represent.
     RELEVANT_TECHNIQUES = {
-        "AML.T0001": "Prompt Injection",
-        "AML.T0002": "Jailbreak",
-        "AML.T0003": "Training Data Extraction",
-        "AML.T0004": "Model Inversion",
-        "AML.T0005": "Membership Inference",
-        "AML.T0006": "Adversarial Example",
-        "AML.T0007": "Backdoor",
-        "AML.T0008": "Data Poisoning",
-        "AML.T0009": "Model Extraction",
-        "AML.T0010": "Supply Chain",
-        "AML.T0011": "Privilege Escalation",
-        "AML.T0012": "Credential Access",
-        "AML.T0013": "Discovery",
-        "AML.T0014": "Lateral Movement",
-        "AML.T0015": "Collection",
-        "AML.T0016": "Exfiltration",
+        "AML.T0051": "injection",        # LLM Prompt Injection
+        "AML.T0002": "jailbreak",        # System Prompt Jailbreak
+        "AML.T0034": "exfiltration",     # Exfiltration via Generation
+        "AML.T0016": "exfiltration",     # Exfiltration
+        "AML.T0003": "exfiltration",     # Training Data Extraction
+        "AML.T0040": "encoding",         # Obfuscated Files or Information
     }
 
     def __init__(self, embedding_engine: EmbeddingEngine):
@@ -565,46 +556,105 @@ class MITREAtlasStream:
         skipped = []
 
         try:
+            import yaml
             import urllib.request
             with urllib.request.urlopen(self.ATLAS_URL, timeout=30) as resp:
-                data = json.loads(resp.read().decode())
+                doc = yaml.safe_load(resp.read().decode())
 
-            for tech in data:
-                tech_id = tech.get("id", "")
+            techniques = doc.get("techniques", {})
+            for tech_id, tech in techniques.items():
                 if tech_id not in self.RELEVANT_TECHNIQUES:
                     continue
+                name = tech.get("name", "").strip()
+                if not name:
+                    continue
+                # The technique name itself is a deterministic attack probe.
+                prompt = name
+                category = self.RELEVANT_TECHNIQUES[tech_id]
 
-                # Extract example procedures/patterns from technique
-                for example in tech.get("procedure_examples", []):
-                    prompt = example.get("description", "")
-                    if not prompt or len(prompt) < 20:
-                        continue
+                fp = hashlib.sha256(f"mitre_atlas:{tech_id}".encode()).hexdigest()[:16]
+                if fp in existing_fps:
+                    continue
+                emb = self.embedding_engine.embed_one(prompt)
+                if self.embedding_engine.is_duplicate(emb, existing_embs):
+                    continue
 
-                    fp = hashlib.sha256(f"mitre_atlas:{tech_id}:{prompt}".encode()).hexdigest()[:16]
-                    if fp in existing_fps:
-                        continue
-                    emb = self.embedding_engine.embed_one(prompt)
-                    if self.embedding_engine.is_duplicate(emb, existing_embs):
-                        continue
-
-                    sample = CrowdSample(
-                        prompt=prompt,
-                        verdict="BLOCKED",
-                        category=self.RELEVANT_TECHNIQUES[tech_id].lower().replace(" ", "_"),
-                        source="mitre_atlas",
-                        source_id=tech_id,
-                        metadata={"technique": tech_id, "name": tech.get("name", "")},
-                        embedding=emb,
-                    )
-                    samples.append(sample)
-                    existing_fps.add(fp)
-                    existing_embs.append(emb)
+                sample = CrowdSample(
+                    prompt=prompt,
+                    verdict="BLOCKED",
+                    category=category,
+                    source="mitre_atlas",
+                    source_id=tech_id,
+                    metadata={"technique": tech_id, "name": name},
+                    embedding=emb,
+                )
+                samples.append(sample)
+                existing_fps.add(fp)
+                existing_embs.append(emb)
 
             skipped.append(f"mitre_atlas: collected {len(samples)} samples")
 
         except Exception as e:
             skipped.append(f"mitre_atlas: {e}")
 
+        return samples, skipped
+
+
+# ============================================================================
+# STREAM 1b: CURATED BENIGN BUSINESS SET (FALSE-POSITIVE GATES)
+# ============================================================================
+
+class BenignBusinessStream:
+    """Read the curated benign business CSV (benign_business.csv).
+
+    Provides the must-NOT-block test data for the benign gates
+    (benign_ops / benign_code / benign_education). Rows are SAFE with an
+    explicit category. Strictly in scope: legitimate SMB business queries,
+    no subjective content-safety samples.
+    """
+
+    def __init__(self, embedding_engine: EmbeddingEngine, csv_path: Path):
+        self.embedding_engine = embedding_engine
+        self.csv_path = csv_path
+
+    def fetch(self, existing_fps: set, existing_embs: List[np.ndarray]) -> Tuple[List[CrowdSample], List[str]]:
+        samples = []
+        skipped = []
+        if not self.csv_path.exists():
+            return [], [f"benign_business: {self.csv_path.name} not found"]
+        try:
+            df = pd.read_csv(self.csv_path)
+        except Exception as e:
+            return [], [f"benign_business: {e}"]
+
+        for idx, row in df.iterrows():
+            prompt = str(row.get("prompt", "")).strip()
+            if not prompt or len(prompt) < 5:
+                skipped.append(f"benign_business[{idx}]: empty/short prompt")
+                continue
+            fp = hashlib.sha256(f"benign_business:{prompt}".encode()).hexdigest()[:16]
+            if fp in existing_fps:
+                skipped.append(f"benign_business[{idx}]: exact duplicate")
+                continue
+            emb = self.embedding_engine.embed_one(prompt)
+            if self.embedding_engine.is_duplicate(emb, existing_embs):
+                skipped.append(f"benign_business[{idx}]: embedding duplicate")
+                continue
+
+            sample = CrowdSample(
+                prompt=prompt,
+                verdict="SAFE",
+                category=str(row.get("category", "benign_ops")).strip(),
+                source="benign_business",
+                source_id=f"benign_business:{idx}",
+                metadata={"curated": True},
+                embedding=emb,
+            )
+            samples.append(sample)
+            existing_fps.add(fp)
+            existing_embs.append(emb)
+
+        skipped.append(f"benign_business: collected {len(samples)} samples")
         return samples, skipped
 
 
@@ -706,15 +756,18 @@ class ProductionTelemetryStream:
 class IntelligencePipeline:
     """Orchestrates all four streams, dedup, disagreement detection, benchmark."""
 
-    def __init__(self, eval_dataset_path: Path, review_queue_path: Path, model_dir: Path):
+    def __init__(self, eval_dataset_path: Path, review_queue_path: Path, model_dir: Path,
+                 inbox_path: Optional[Path] = None):
         self.eval_dataset_path = eval_dataset_path
         self.review_queue_path = review_queue_path
         self.model_dir = model_dir
+        self.inbox_path = inbox_path or (model_dir / "eval_inbox.jsonl")
 
         self.embedding_engine = EmbeddingEngine()
         self.hf_stream = HFDatasetStream(self.embedding_engine)
         self.garak_stream = GarakAdapter(self.embedding_engine)
         self.mitre_stream = MITREAtlasStream(self.embedding_engine)
+        self.benign_stream = BenignBusinessStream(self.embedding_engine, model_dir / "benign_business.csv")
         self.prod_stream = ProductionTelemetryStream(self.embedding_engine, model_dir / "telemetry")
 
         # Load existing eval dataset for dedup
@@ -728,7 +781,7 @@ class IntelligencePipeline:
             return
         # CSV format: "prompt","verdict","category","source"
         import csv
-        with open(self.eval_dataset_path) as f:
+        with open(self.eval_dataset_path, encoding="utf-8-sig") as f:
             reader = csv.reader(f)
             for row in reader:
                 if len(row) >= 4:
@@ -747,9 +800,16 @@ class IntelligencePipeline:
         all_samples = []
         all_skipped = []
 
-        # Stream 1: Academic HF
-        print("📚 Stream 1: Fetching HF datasets...")
+        # Stream 1: Academic HF (adversarial datasets only)
+        print("📚 Stream 1: Fetching adversarial HF datasets...")
         samples, skipped = self.hf_stream.fetch_all(self.existing_fps, self.existing_embeddings)
+        all_samples.extend(samples)
+        all_skipped.extend(skipped)
+        print(f"  +{len(samples)} samples")
+
+        # Stream 1b: Curated benign business set (false-positive gates)
+        print("⚪ Stream 1b: Curated benign business set...")
+        samples, skipped = self.benign_stream.fetch(self.existing_fps, self.existing_embeddings)
         all_samples.extend(samples)
         all_skipped.extend(skipped)
         print(f"  +{len(samples)} samples")
@@ -780,17 +840,20 @@ class IntelligencePipeline:
         print("🤖 Auto-labeling with current guardrail...")
         disagreements = self._auto_label_and_detect_disagreements(all_samples)
 
-        # Export review queue
+        # Export disagreements to the human-review curation queue.
         self._export_review_queue(disagreements)
 
-        # Append non-disputed samples to eval dataset
-        self._append_to_eval_dataset([s for s in all_samples if not self._is_disputed(s, disagreements)])
+        # Stage fresh pulls into a curation INBOX (canonical JSONL). The gold
+        # eval set is NOT auto-appended here - growing it is a human curation
+        # step (see curate_inbox). Disagreements also land in the review queue.
+        self._append_to_inbox(all_samples)
 
         return {
             "total_collected": len(all_samples),
             "by_source": self._count_by_source(all_samples),
             "label_breakdown": summarize_labels(all_samples),
             "disagreements": len(disagreements),
+            "inbox_count": len(all_samples),
             "skipped_count": len(all_skipped),
             "skipped_details": all_skipped[:20],
         }
@@ -871,19 +934,82 @@ class IntelligencePipeline:
                     "metadata": d.sample.metadata,
                 }) + "\n")
 
-    def _append_to_eval_dataset(self, samples: List[CrowdSample]):
-        """Append new samples to eval_dataset_v2.csv."""
+    def _append_to_inbox(self, samples: List[CrowdSample]):
+        """Stage fresh pulls into the curation inbox (canonical JSONL, no emb)."""
         if not samples:
             return
-
-        import csv
-        file_exists = self.eval_dataset_path.exists()
-        with open(self.eval_dataset_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["prompt", "verdict", "category", "source"])
+        self.inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.inbox_path, "a", encoding="utf-8") as f:
             for s in samples:
-                writer.writerow([s.prompt, s.verdict, s.category, s.source])
+                d = s.to_dict()
+                d.pop("embedding", None)
+                f.write(json.dumps(d) + "\n")
+
+    def curate_inbox(self, fingerprints: Optional[set] = None) -> int:
+        """Promote vetted inbox entries into the gold eval CSV and drop them
+        from the inbox. `fingerprints=None` promotes everything in the inbox;
+        otherwise only entries whose fingerprint is in the set. Returns the
+        number promoted. The gold CSV is written in its OWN header schema, so
+        curated (expected/family) files stay internally consistent.
+        """
+        if not self.inbox_path.exists():
+            return 0
+        promoted = []
+        remaining = []
+        with open(self.inbox_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                fp = entry.get("fingerprint")
+                if fingerprints is None or fp in fingerprints:
+                    promoted.append(entry)
+                else:
+                    remaining.append(entry)
+
+        if promoted:
+            self._write_to_eval(promoted)
+
+        if remaining:
+            # keep promoted drops by rewriting only the remaining entries
+            with open(self.inbox_path, "w", encoding="utf-8") as f:
+                for e in remaining:
+                    f.write(json.dumps(e) + "\n")
+        else:
+            self.inbox_path.unlink(missing_ok=True)
+        return len(promoted)
+
+    def _write_to_eval(self, entries: List[Dict]):
+        """Append canonical entries to the gold eval CSV using ITS current
+        header (expected/family or verdict/category), creating it if needed."""
+        header = None
+        if self.eval_dataset_path.exists():
+            with open(self.eval_dataset_path, newline="", encoding="utf-8") as f:
+                header = next(csv.reader(f), None)
+        if not header:
+            header = ["prompt", "verdict", "category", "source"]
+        new_file = not self.eval_dataset_path.exists()
+
+        with open(self.eval_dataset_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if new_file:
+                writer.writerow(header)
+            for e in entries:
+                row = []
+                for h in header:
+                    hl = h.strip().lower().lstrip("\ufeff")
+                    if hl == "prompt":
+                        row.append(e.get("prompt", ""))
+                    elif hl in ("verdict", "expected"):
+                        row.append(e.get("verdict", ""))
+                    elif hl in ("category", "family"):
+                        row.append(e.get("category", ""))
+                    elif hl == "source":
+                        row.append(e.get("source", ""))
+                    else:
+                        row.append("")
+                writer.writerow(row)
 
     def _count_by_source(self, samples: List[CrowdSample]) -> Dict[str, int]:
         counts = {}
@@ -896,7 +1022,7 @@ def summarize_labels(samples: List[CrowdSample]) -> Dict[str, Any]:
     """Per-source ground-truth verdict distribution + per-category counts.
 
     Purpose: make a degenerate stream visible. A source that emits only SAFE
-    (e.g. hh-rlhf, chosen-only) or only BLOCKED (pre-fix BeaverTails) is a
+    (benign-only) or only BLOCKED (single-class attack source) is a
     red flag that the ground truth is uninformative — indistinguishable from
     healthy at the old "+N samples" level.
     """
@@ -919,6 +1045,71 @@ def summarize_labels(samples: List[CrowdSample]) -> Dict[str, Any]:
 # STRATIFIED BENCHMARK
 # ============================================================================
 
+def is_benign_verdict(verdict: str) -> bool:
+    return verdict in BENIGN_VERDICTS
+
+
+# Curated eval CSV "family" values -> controlled vocabulary (benign, harmful).
+# The curated families are hand-tagged attack/benign families; map them onto
+# the benchmark GATE categories so the real gold set grades the real gates.
+CURATED_CATEGORY_MAP = {
+    "benign-guard":         ("benign_ops", "benign_ops"),
+    "cross-lingual":        ("benign_education", "jailbreak"),
+    "data-exfil":           ("benign_ops", "exfiltration"),
+    "direct-jailbreak":     ("benign_ops", "jailbreak"),
+    "encoding-obfuscation": ("benign_ops", "encoding"),
+    "fp-probe":             ("benign_ops", "kill_switch"),
+    "indirect-injection":   ("benign_ops", "injection"),
+    "many-shot-fewshot":    ("benign_ops", "jailbreak"),
+    "roleplay-jailbreak":   ("benign_ops", "jailbreak"),
+    "system-disclosure":    ("benign_ops", "exfiltration"),
+    "tool-injection":       ("benign_ops", "injection"),
+    "xml-json-shift":       ("benign_ops", "injection"),
+}
+
+
+def load_eval_rows(path: Path) -> List[Dict[str, str]]:
+    """Canonicalize an eval CSV into {prompt, verdict, category, source}.
+
+    Handles both schemas:
+      - pipeline schema: prompt,verdict,category,source
+      - curated schema:  prompt,expected,family,source
+    Curated 'family' is mapped into the controlled vocabulary via
+    CURATED_CATEGORY_MAP (per verdict); unmapped families pass through.
+    Read-only / non-destructive.
+    """
+    rows: List[Dict[str, str]] = []
+    if not path.exists():
+        return rows
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return rows
+        cols = {k.strip().lower().lstrip("\ufeff"): k for k in reader.fieldnames}
+        prompt_key = cols.get("prompt")
+        verdict_key = cols.get("verdict") or cols.get("expected")
+        category_key = cols.get("category") or cols.get("family")
+        source_key = cols.get("source")
+        for record in reader:
+            if prompt_key is None:
+                break
+            prompt = (record.get(prompt_key) or "").strip()
+            if not prompt:
+                continue
+            verdict = (record.get(verdict_key) or "SAFE").strip()
+            raw_cat = (record.get(category_key) or "").strip().lower()
+            pair = CURATED_CATEGORY_MAP.get(raw_cat)
+            category = pair[0] if (pair and is_benign_verdict(verdict)) else \
+                       (pair[1] if pair else raw_cat)
+            rows.append({
+                "prompt": prompt,
+                "verdict": verdict,
+                "category": category,
+                "source": (record.get(source_key) or "").strip().lower() if source_key else "",
+            })
+    return rows
+
+
 class StratifiedBenchmark:
     """Run benchmark with category-specific pass rates."""
 
@@ -938,21 +1129,17 @@ class StratifiedBenchmark:
 
     def run(self, guardrail) -> Dict[str, Any]:
         """Run benchmark, return per-category results."""
-        import csv
-
         if not self.eval_dataset_path.exists():
             return {"error": "eval dataset not found"}
 
-        # Load and categorize
+        # Load and categorize via the canonical (schema-agnostic) loader.
         by_category = {}
-        with open(self.eval_dataset_path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                cat = row.get("category", "unknown")
-                if cat not in by_category:
-                    by_category[cat] = {"total": 0, "correct": 0, "samples": []}
-                by_category[cat]["total"] += 1
-                by_category[cat]["samples"].append(row)
+        for row in load_eval_rows(self.eval_dataset_path):
+            cat = row["category"] or "unknown"
+            if cat not in by_category:
+                by_category[cat] = {"total": 0, "correct": 0, "samples": []}
+            by_category[cat]["total"] += 1
+            by_category[cat]["samples"].append(row)
 
         # Run guardrail on each
         results = {}
@@ -1002,6 +1189,63 @@ class StratifiedBenchmark:
 # ============================================================================
 # CRON JOB ENTRY POINT
 # ============================================================================
+
+def run_stream1_dry_run(tmp_eval: Path, max_per_dataset: int = 50,
+                        dataset_ids: Optional[List[str]] = None,
+                        embedding_engine: Optional[EmbeddingEngine] = None,
+                        guardrail: Optional[Any] = None) -> Dict[str, Any]:
+    """End-to-end Stream-1 feedback loop on a FRESH temp eval file.
+
+    Demonstrates the intended loop on real HF data without touching the
+    curated eval file or the review queue:
+      fetch -> normalize/dedup -> write pipeline-schema CSV -> stratified
+      benchmark -> gate verdict.
+
+    `embedding_engine` / `guardrail` are injectable for tests; `dataset_ids`
+    restricts the catalog by case-insensitive substring (e.g. ["toxic"]).
+    """
+    if not HF_AVAILABLE:
+        raise RuntimeError("datasets library not available - pip install datasets")
+    if embedding_engine is None:
+        embedding_engine = EmbeddingEngine()
+
+    stream = HFDatasetStream(embedding_engine, max_per_dataset=max_per_dataset)
+    if dataset_ids:
+        wanted = [d.lower() for d in dataset_ids]
+        stream.DATASETS = [cfg for cfg in HFDatasetStream.DATASETS
+                           if any(w in cfg[0].lower() for w in wanted)]
+
+    print("📚 Dry-run Stream 1: fetching HF datasets...")
+    samples, skipped = stream.fetch_all(set(), [])
+    print(f"  +{len(samples)} samples (skipped/errors: {len(skipped)})")
+    if not samples:
+        return {"error": "no samples collected", "skipped": skipped[:10]}
+
+    # Fresh pipeline-schema CSV (the exact columns the benchmark reads).
+    tmp_eval.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp_eval, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["prompt", "verdict", "category", "source"])
+        for s in samples:
+            writer.writerow([s.prompt, s.verdict, s.category, s.source])
+
+    breakdown = summarize_labels(samples)
+    print("  Ground-truth verdicts by source (stream health):")
+    for src, vs in breakdown["verdicts_by_source"].items():
+        print(f"    {src:16s} {vs}")
+
+    if guardrail is None:
+        from dlp_guardrail_with_llm import IntentGuardrailWithLLM
+        guardrail = IntentGuardrailWithLLM(gemini_api_key=None, rate_limit=1000)
+    bench = StratifiedBenchmark(tmp_eval).run(guardrail)
+
+    print(f"  Overall pass rate: {bench['overall_pass_rate']:.3f} ({bench['total_samples']} samples)")
+    for cat, res in bench["by_category"].items():
+        status = "✅" if res["passed"] else "❌"
+        print(f"    {status} {cat}: {res['pass_rate']:.3f} (target ≥{res['target']:.3f})")
+
+    return {"label_breakdown": breakdown, "benchmark": bench, "tmp_eval": str(tmp_eval)}
+
 
 def run_weekly_pipeline():
     """Entry point for cron job."""
@@ -1061,4 +1305,19 @@ def run_weekly_pipeline():
 
 
 if __name__ == "__main__":
+    args = list(sys.argv[1:])
+    if "--dry-run" in args:
+        args.remove("--dry-run")
+        max_n = 50
+        if "--max" in args:
+            j = args.index("--max")
+            max_n = int(args[j + 1])
+            del args[j:j + 2]
+        tmp = Path(__file__).parent / "eval_dryrun.csv"
+        result = run_stream1_dry_run(tmp, max_per_dataset=max_n, dataset_ids=args or None)
+        if "error" in result:
+            print("\n❌ Dry-run failed:", result["error"])
+            sys.exit(1)
+        print(f"\nDry-run CSV written to: {result['tmp_eval']}")
+        sys.exit(0)
     sys.exit(run_weekly_pipeline())
