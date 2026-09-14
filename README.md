@@ -1,4 +1,4 @@
-# 🛡️ DLP Guardrail — Intent-Based Prompt Defense for LLM Applications
+# 🛡️ DLP Guardrail — Intent-Based Defense for LLM Applications
 
 **A 4-layer guardrail that catches malicious prompts — jailbreaks, prompt injections, and data-exfiltration attempts — before they reach your model.**
 
