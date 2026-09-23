@@ -19,11 +19,13 @@ fastembed>=0.5.0
 # transformers==4.46.3
 # torch==2.5.1
 #
-# BYOK LLM judge (pick ONE provider below at runtime):
-#   provider   |  env var for your API key     | default model
-#   google     |  GEMINI_API_KEY               | gemini-2.5-flash
-#   anthropic  |  ANTHROPIC_API_KEY            | claude-3-5-haiku-latest
-#   openai     |  OPENAI_API_KEY               | gpt-4o-mini
-#   openrouter |  OPENROUTER_API_KEY           | openrouter/auto
-#   opencode-zen | OPENCODE_ZEN_API_KEY        | deepseek-v4-flash-free
+# BYOK LLM judge (pick ONE provider at runtime):
+#   provider       |  env var for your API key        | default model
+#   google         |  GEMINI_API_KEY                  | gemini-1.5-flash
+#   anthropic      |  ANTHROPIC_API_KEY               | claude-3-5-haiku-latest
+#   openai         |  OPENAI_API_KEY                  | gpt-4o-mini
+#   openrouter     |  OPENROUTER_API_KEY              | openrouter/auto
+#   opencode-zen   |  OPENCODE_ZEN_API_KEY            | deepseek-coder
+#   nvidia         |  NVIDIA_API_KEY                  | meta/llama-3.3-70b-instruct
 # Key is read ONLY from the env var; never hardcoded, never logged in full.
+# Multi-provider fallback chain: google → openrouter → anthropic → openai → nvidia → opencode-zen

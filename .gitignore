@@ -34,10 +34,13 @@ build/
 
 # ---- Dev/test artifacts (stay local, never pushed) ----
 benchmark.py
+benchmark_results_store.py
+benchmark_results/
 eval_dataset.csv
 test_engine.py
 test_dlp_gate.py
 test_judge.py
+
 # ---- Internal docs (stay local) ----
 DLP_GUARDRAIL.md
 HANDOFF.md
@@ -45,9 +48,32 @@ PROPOSAL.md
 SYSTEM_DESIGN.md
 My notes.txt
 eval_dataset_v2.csv
-probe_layers.py
+eval_inbox.jsonl
+review_queue.jsonl
+adjudicated.jsonl
+benign_business.csv
+
+# ---- Eval infrastructure (stay local) ----
+intelligence_pipeline.py
+adjudicate_review_queue.py
+
+# ---- Proof of work / content strategy (stay local) ----
+proof_of_work/
+INTELLIGENCE_PIPELINE.md
+PROOF_OF_WORK_POSITIONING.md
+
+# ---- Experimental / scratch (stay local) ----
+test_change*.py
+_run_nvidia_bench.py
 eval_paraphrases.py
-memorization_check.py
 eval_splits.py
+memorization_check.py
+probe_layers.py
+run_full_loop.py
+eval_dryrun.csv
 eval_train.csv
 eval_test.csv
+
+# ---- IDE / misc ----
+.hermes/
+INVESTOR_EVALUATION*.md
