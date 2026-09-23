@@ -1,4 +1,4 @@
-# 🛡️ DLP Guardrail — Intent-Based Prompt Defense for LLM Applications
+# 🛡️ DLP Guardrail — Intent-Based Defense for LLM Applications
 
 **A production-grade 4-layer guardrail that catches prompt injections, jailbreaks, and data-exfiltration attempts before they reach your model — with a continuous learning loop that compounds your defense over time.**
 
@@ -249,15 +249,15 @@ decision = gate.inspect(payload)  # .action = "ALLOW" | "REDACT" | "BLOCK"
 
 ---
 
-## License
+## Privacy
 
-MIT — but the evaluation infrastructure (intelligence pipeline, stratified benchmark, disagreement engine, curation loop) is the proprietary moat.
+- ✅ No data stored — real-time analysis only
+- ✅ Your key stays yours (bring-your-own-key; never hardcoded, never pushed)
+- ✅ Rate limiting (15 req/min default) to control LLM cost
+- ✅ Works fully offline with ML layers alone when rate-limit is hit or no key configured
 
 ---
 
-## Contact
+## Repository
 
-Built by a solo Principal PM with 15+ years in enterprise security (Microsoft CVP, data security).  
-**Not a portfolio piece — a production system with the evaluation discipline to prove it.**
-
-*Found a false positive or a bypass? The pipeline will catch it next week. Thresholds are configurable based on your risk tolerance.*
+Feedback welcome — found a false positive or a bypass? Test more prompts and share your findings. Thresholds are configurable based on your risk tolerance.
