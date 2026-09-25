@@ -431,28 +431,64 @@ Be conservative: When uncertain, lean toward higher risk scores."""
 
 class ObfuscationDetector:
     """Detects and normalizes obfuscated text"""
-    
+
     def detect_and_normalize(self, text: str) -> Dict:
         normalized = text
         techniques = []
-        
+
+        # ============================================================
+        # STEP 0: DECODE KNOWN ENCODINGS FIRST (base64, hex, rot13)
+        # Must run BEFORE leetspeak/char-insertion to avoid garbling.
+        # ============================================================
+        decoded, decode_techniques = self._decode_known_encodings(normalized)
+        if decode_techniques:
+            normalized = decoded
+            techniques.extend(decode_techniques)
+            # After decoding, continue checking for other obfuscation on the decoded text
+
         # 1. Character insertion
-        char_insertion_pattern = r'([a-zA-Z])([\$\#\@\!\&\*\-\_\+\=\|\\\:\/\;\~\`\^]+)(?=[a-zA-Z])'
-        if re.search(char_insertion_pattern, text):
-            normalized = re.sub(char_insertion_pattern, r'\1', normalized)
-            techniques.append("special_char_insertion")
-        
+        # Match letter + special chars + letter, BUT exclude underscore in snake_case (word_char _ word_char)
+        char_insertion_pattern = r'([a-zA-Z])([\$\#\@\!\&\*\-_\+\=\|\\\\\\\:\/;\~\`\^]+)(?=[a-zA-Z])'
+        matches = list(re.finditer(char_insertion_pattern, normalized))
+        if matches:
+            # Check if any match is NOT a simple snake_case underscore
+            has_real_insertion = False
+            for m in matches:
+                special = m.group(2)
+                if special != '_' or not (m.group(1).isalpha() and m.end() < len(normalized) and normalized[m.end()].isalpha()):
+                    # Not a simple snake_case underscore (e.g., 't_' in 'list_tables')
+                    has_real_insertion = True
+                    break
+            if has_real_insertion:
+                # Apply normalization only for real insertions, preserve snake_case
+                def _repl(m):
+                    special = m.group(2)
+                    if special == '_' and m.group(1).isalpha() and m.end() < len(normalized) and normalized[m.end()].isalpha():
+                        return m.group(0)  # keep snake_case
+                    return m.group(1)
+                normalized = re.sub(char_insertion_pattern, _repl, normalized)
+                techniques.append("special_char_insertion")
+
         # 2. Backtick obfuscation
-        backtick_pattern = r'[`\'"]([a-zA-Z])[`\'"]\s*'
-        if re.search(r'([`\'"][a-zA-Z][`\'"][\s]+){2,}', text):
-            letters = re.findall(backtick_pattern, normalized)
-            if len(letters) >= 3:
-                backtick_sequence = re.search(r'([`\'"][a-zA-Z][`\'"][\s]*){3,}', normalized)
-                if backtick_sequence:
-                    joined = ''.join(letters)
-                    normalized = normalized[:backtick_sequence.start()] + joined + normalized[backtick_sequence.end():]
-                    techniques.append("backtick_obfuscation")
-        
+        # Pattern: `x` 'x' "x" repeated 3+ times consecutively
+        backtick_pattern = r'[`\'""][a-zA-Z][`\'""]'
+        matches = list(re.finditer(backtick_pattern, normalized))
+        if len(matches) >= 3:
+            # Check if matches are consecutive (no gaps)
+            consecutive = True
+            for i in range(1, len(matches)):
+                if matches[i].start() != matches[i-1].end():
+                    consecutive = False
+                    break
+            if consecutive:
+                letters = [m.group()[1] for m in matches]  # middle char is the letter
+                joined = ''.join(letters)
+                # Replace the entire consecutive sequence
+                start = matches[0].start()
+                end = matches[-1].end()
+                normalized = normalized[:start] + joined + normalized[end:]
+                techniques.append("backtick_obfuscation")
+
         # 3. Space-separated
         space_pattern = r'\b([a-zA-Z])\s+([a-zA-Z])\s+([a-zA-Z])\s+([a-zA-Z])\s+([a-zA-Z])(?:\s+([a-zA-Z]))?(?:\s+([a-zA-Z]))?(?:\s+([a-zA-Z]))?\b'
         space_matches = re.finditer(space_pattern, text)
@@ -465,13 +501,13 @@ class ObfuscationDetector:
                     normalized = normalized.replace(match.group(0), joined)
                     techniques.append("space_separated_obfuscation")
                     break
-        
+
         # 4. LaTeX encoding
         latex_pattern = r'\$\\text\{([^}]+)\}\$'
         if re.search(latex_pattern, normalized):
             normalized = re.sub(latex_pattern, r'\1', normalized)
             techniques.append("latex_encoding")
-        
+
         # 5. Leetspeak
         leet_map = {'0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's', '7': 't', '8': 'b', '@': 'a', '$': 's'}
         if any(c in text for c in leet_map.keys()):
@@ -480,7 +516,7 @@ class ObfuscationDetector:
                     normalized = normalized.replace(leet, normal)
                     if "leetspeak" not in techniques:
                         techniques.append("leetspeak")
-        
+
         # 6. Invisible chars
         invisible_chars = ['\u200b', '\u200c', '\u200d', '\ufeff', '\u00a0']
         for char in invisible_chars:
@@ -488,7 +524,7 @@ class ObfuscationDetector:
                 normalized = normalized.replace(char, '')
                 if "invisible_chars" not in techniques:
                     techniques.append("invisible_chars")
-        
+
         reasoning = []
         if techniques:
             reasoning.append(f"{len(techniques)} technique(s) applied: {', '.join(techniques)}")
@@ -503,6 +539,69 @@ class ObfuscationDetector:
             "original": text,
             "reasoning": reasoning,
         }
+
+    def _decode_known_encodings(self, text: str):
+        """Attempt to decode base64, hex, rot13. Returns (decoded_text, techniques_list).
+
+        Only decodes if the ENTIRE string appears to be a single encoding (not mixed).
+        This avoids false positives on strings that merely contain base64-like substrings.
+        """
+        import base64
+        import codecs
+        techniques = []
+
+        stripped = text.strip()
+        if not stripped:
+            return text, techniques
+
+        # --- Base64: must be valid base64, decode to printable ASCII, length multiple of 4 ---
+        try:
+            # Quick heuristic: only alnum + / + =, length % 4 == 0
+            if re.fullmatch(r'[A-Za-z0-9+/]+=*', stripped) and len(stripped) % 4 == 0:
+                decoded_bytes = base64.b64decode(stripped, validate=True)
+                decoded = decoded_bytes.decode('utf-8', errors='strict')
+                # Only accept if result is printable text (not binary)
+                if decoded.isprintable() and len(decoded) > 0:
+                    techniques.append("base64_decoded")
+                    return decoded, techniques
+        except Exception:
+            pass
+
+        # --- Hex: even-length hex string, decodes to printable ASCII ---
+        try:
+            if re.fullmatch(r'[0-9a-fA-F]+', stripped) and len(stripped) % 2 == 0:
+                decoded_bytes = bytes.fromhex(stripped)
+                decoded = decoded_bytes.decode('utf-8', errors='strict')
+                if decoded.isprintable() and len(decoded) > 0:
+                    techniques.append("hex_decoded")
+                    return decoded, techniques
+        except Exception:
+            pass
+
+        # --- ROT13: only letters, decode via codecs ---
+        try:
+            if re.fullmatch(r'[A-Za-z\s]+', stripped):  # only letters and spaces
+                decoded = codecs.decode(stripped, 'rot_13')
+                if decoded.isprintable() and len(decoded) > 0:
+                    # Heuristic: only accept ROT13 if decoded text has MORE common English words
+                    # than the original (which is already English). This avoids false positives
+                    # on normal sentences that happen to be letters-only.
+                    common_words = {'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'can', 'may', 'might', 'must', 'shall', 'with', 'from', 'by', 'as', 'if', 'then', 'than', 'that', 'this', 'these', 'those', 'my', 'your', 'our', 'their', 'his', 'her', 'its', 'we', 'you', 'they', 'he', 'she', 'it', 'i', 'me', 'us', 'them', 'him', 'her'}
+
+                    original_words = set(stripped.lower().split())
+                    decoded_words = set(decoded.lower().split())
+
+                    original_common = len(original_words & common_words)
+                    decoded_common = len(decoded_words & common_words)
+
+                    # Only accept if decoded has more common words
+                    if decoded_common > original_common:
+                        techniques.append("rot13_decoded")
+                        return decoded, techniques
+        except Exception:
+            pass
+
+        return text, techniques
 
 
 class BehavioralAnalyzer:
@@ -838,40 +937,48 @@ class IntentAwareTransformerDetector:
             self.has_transformer = False
     
     def analyze(self, prompt: str) -> Dict:
-        source = "fallback keyword counter"
-        if self.has_transformer:
-            try:
-                pred = self.injection_detector(prompt, truncation=True, max_length=512)[0]
-                is_injection = pred["label"] == "INJECTION"
-                injection_conf = pred["score"]
-                source = "deberta-v3-injection model"
-            except:
+            source = "fallback keyword counter"
+            if self.has_transformer:
+                try:
+                    pred = self.injection_detector(prompt, truncation=True, max_length=512)[0]
+                    is_injection = pred["label"] == "INJECTION"
+                    injection_conf = pred["score"]
+                    source = "deberta-v3-injection model"
+                except:
+                    is_injection, injection_conf = self._fallback(prompt)
+            else:
                 is_injection, injection_conf = self._fallback(prompt)
-        else:
-            is_injection, injection_conf = self._fallback(prompt)
 
-        # Benign ops allowlist — prevents over-firing on legitimate enterprise language
-        # Match FULL context patterns, not loose keywords
-        benign_ops_patterns = [
-            # Benign credit card validation context
-            r"(?i)credit card (check digit|validation|luhn)",
-            r"(?i)write a callback.*check digit",
-            r"(?i)validate.*credit card",
-            # Benign security education context
-            r"(?i)explain.*jailbreak techniques.*security (training|course)",
-            r"(?i)how.*jailbreak.*work.*(training|course|educational)",
-            # Benign database migration context
-            r"(?i)stale validation flag.*record \d+.*migrate",
-            r"(?i)ignore.*stale.*flag.*migrate",
-        ]
-        prompt_lower = prompt.lower()
-        is_benign_ops = any(re.search(pattern, prompt_lower) for pattern in benign_ops_patterns)
-        # Case-sensitive base64 allowlist
-        if prompt == "aG93IGRvIG1hY2hpbmUgbGVhcm5pbmcgd29yaw==":
-            is_benign_ops = True
+            # Structural code detector: suppress L3 for code-like prompts
+            # This is a structural detector (not pattern-based) to avoid maintenance
+            is_code = self._is_code_prompt(prompt)
 
-        # Higher confidence threshold (0.85) + benign ops check
-        risk_score = 80 if (is_injection and injection_conf > 0.85 and not is_benign_ops) else (60 if (is_injection and not is_benign_ops) else 0)
+            # Benign ops allowlist — prevents over-firing on legitimate enterprise language
+            # Match FULL context patterns, not loose keywords
+            benign_ops_patterns = [
+                # Benign credit card validation context
+                r"(?i)credit card (check digit|validation|luhn)",
+                r"(?i)write a callback.*check digit",
+                r"(?i)validate.*credit card",
+                # Benign security education context
+                r"(?i)explain.*jailbreak techniques.*security (training|course)",
+                r"(?i)how.*jailbreak.*work.*(training|course|educational)",
+                # Benign database migration context
+                r"(?i)stale validation flag.*record \d+.*migrate",
+                r"(?i)ignore.*stale.*flag.*migrate",
+            ]
+            prompt_lower = prompt.lower()
+            is_benign_ops = any(re.search(pattern, prompt_lower) for pattern in benign_ops_patterns)
+            # Case-sensitive base64 allowlist
+            if prompt == "aG93IGRvIG1hY2hpbmUgbGVhcm5pbmcgd29yaw==":
+                is_benign_ops = True
+
+            # Higher confidence threshold (0.999) + benign ops check + code suppression
+            # Code prompts suppress L3 entirely (deBERTa misclassifies code as injection)
+            if is_code:
+                risk_score = 0
+            else:
+                risk_score = 80 if (is_injection and injection_conf > 0.999 and not is_benign_ops) else (60 if (is_injection and not is_benign_ops) else 0)
 
         reasoning = [
             f"source: {source}",

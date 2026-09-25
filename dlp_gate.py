@@ -219,10 +219,27 @@ class GuardrailGate:
     def __init__(self,
                  guardrail=None,
                  gate: Optional[DataGate] = None,
-                 audit: Optional[AuditTrail] = None):
+                 audit: Optional[AuditTrail] = None,
+                 quarantine_path: str = "dlp_quarantine.jsonl"):
         self._guardrail = guardrail
         self._gate = gate or DataGate()
         self._audit = audit or AuditTrail()
+        self._quarantine_path = quarantine_path
+
+    def _quarantine(self, payload: str, error: str) -> None:
+        """Write failed payload + error to quarantine log for forensics."""
+        import traceback
+        import json
+        from datetime import datetime, timezone
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            "payload_preview": payload[:500],
+            "error": error,
+            "traceback": traceback.format_exc(),
+        }
+        with open(self._quarantine_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
 
     def inspect(self, payload: str) -> Decision:
         intent_verdict, risk, llm_used = "SAFE", 0, False
@@ -232,9 +249,13 @@ class GuardrailGate:
                 intent_verdict = g["verdict"]
                 risk = g["risk_score"]
                 llm_used = g["llm_status"]["used"]
-            except Exception:
-                # the gate must never be a single point of failure
-                pass
+            except Exception as e:
+                # FAIL-CLOSED: any analyzer crash -> quarantine + BLOCK
+                # Never fail-open in a security gateway.
+                self._quarantine(payload, f"{type(e).__name__}: {e}")
+                intent_verdict = "BLOCKED"
+                risk = 100
+                llm_used = False
         decision = self._gate.inspect(payload, intent_verdict, risk, llm_used)
         self._audit.record(decision, payload)
         return decision
