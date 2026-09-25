@@ -77,3 +77,8 @@ eval_test.csv
 # ---- IDE / misc ----
 .hermes/
 INVESTOR_EVALUATION*.md
+eval_out_of_scope.csv
+eval_in_scope.csv
+.gitignore
+.gitignore
+INVESTMENT_REVIEW_NIKESH_ARORA.md

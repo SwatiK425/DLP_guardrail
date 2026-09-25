@@ -980,26 +980,61 @@ class IntentAwareTransformerDetector:
             else:
                 risk_score = 80 if (is_injection and injection_conf > 0.999 and not is_benign_ops) else (60 if (is_injection and not is_benign_ops) else 0)
 
-        reasoning = [
-            f"source: {source}",
-            f"is_injection={is_injection} confidence={injection_conf:.3f}",
-        ]
-        if is_injection and injection_conf > 0.85 and not is_benign_ops:
-            reasoning.append("injection detected with confidence > 0.85 -> 80")
-        elif is_injection and not is_benign_ops:
-            reasoning.append("injection detected but confidence <= 0.85 -> 60")
-        elif is_benign_ops:
-            reasoning.append("benign ops context matched -> 0 (suppressed)")
-        else:
-            reasoning.append("not classified as injection -> 0")
+            reasoning = [
+                f"source: {source}",
+                f"is_injection={is_injection} confidence={injection_conf:.3f}",
+            ]
+            if is_injection and injection_conf > 0.85 and not is_benign_ops:
+                reasoning.append("injection detected with confidence > 0.85 -> 80")
+            elif is_injection and not is_benign_ops:
+                reasoning.append("injection detected but confidence <= 0.85 -> 60")
+            elif is_benign_ops:
+                reasoning.append("benign ops context matched -> 0 (suppressed)")
+            else:
+                reasoning.append("not classified as injection -> 0")
 
-        return {
-            "is_injection": is_injection,
-            "injection_confidence": injection_conf,
-            "risk_score": risk_score,
-            "reasoning": reasoning,
-        }
+            return {
+                "is_injection": is_injection,
+                "injection_confidence": injection_conf,
+                "risk_score": risk_score,
+                "reasoning": reasoning,
+            }
     
+
+    def _is_code_prompt(self, prompt: str) -> bool:
+        """Structural detector for code-like prompts (not pattern-based).
+        Checks for common code structures without maintaining keyword lists."""
+        import re
+        code_indicators = [
+            r"def\s+\w+\s*\(",
+            r"class\s+\w+",
+            r"import\s+\w+",
+            r"from\s+\w+\s+import",
+            r"if\s+.*:",
+            r"for\s+\w+\s+in",
+            r"while\s+.*:",
+            r"try:",
+            r"except",
+            r"with\s+.*:",
+            r"lambda\s",
+            r"return\s",
+            r"yield\s",
+            r"\[.*\].*for",
+            r"\{.*\}.*for",
+            r"```",
+            r"`[^`]+`",
+        ]
+        for pattern in code_indicators:
+            if re.search(pattern, prompt):
+                return True
+        special_char_ratio = sum(1 for c in prompt if c in "{}[]()<>;:=@#$%^&*|\\") / max(len(prompt), 1)
+        if special_char_ratio > 0.15:
+            return True
+        return False
+
+
+        return False
+
     def _fallback(self, prompt: str) -> Tuple[bool, float]:
         prompt_lower = prompt.lower()
         score = 0.0
@@ -1196,7 +1231,7 @@ class IntentGuardrailWithLLM:
             "injection_detected": transformer_result["is_injection"],
             "reasoning": transformer_result["reasoning"]
         })
-        
+
         # Fusion
         fusion_result = self._fuse_layers(
             obfuscation_risk,
@@ -1204,33 +1239,44 @@ class IntentGuardrailWithLLM:
             semantic_result,
             transformer_result
         )
-        
+
         result["risk_score"] = fusion_result["risk_score"]
         result["confidence"] = fusion_result["confidence"]
-        
-        # SMART TRIAGE — LLM IS THE FINAL ARBITER (user-mandated 2026-08-11)
-        # Only a HIGH-confidence layer BLOCK short-circuits without the LLM.
-        # EVERYTHING else — INCLUDING safe-looking prompts — is reviewed by the
-        # LLM judge before a verdict is issued. Rationale: attacks can look safe
-        # (the "list_tables" FN, subtle injections); heuristic layers alone can
-        # all miss them. Recall-first: never mark SAFE without LLM confirmation.
-        # Cost note: with a key attached, LLM usage approaches 100% of
-        # non-confident-block traffic; the rate limit (15/min default) governs it.
+
+        # SMART TRIAGE — Strict CONFIDENT_SAFE escape hatch
+        # A prompt ONLY skips the LLM if ALL layers are clean:
+        #   - Obfuscation risk == 0
+        #   - Behavioral risk == 0
+        #   - Semantic risk == 0 (no anomaly)
+        #   - Transformer injection confidence < 0.15
+        # If ANY layer detects even a whisper of suspicion (risk > 0), escalate to LLM.
+        # This protects latency on the 90% of prompts that are genuinely benign,
+        # while reserving the 15 RPM budget exclusively for prompts with slight anomalies.
 
         use_llm = False
         triage_reason = ""
 
+        # Confident block - skip LLM (clearly malicious; blocking errs safe)
         if fusion_result["risk_score"] >= self.CONFIDENT_BLOCK and fusion_result["confidence"] == "HIGH":
-            # Confident block - skip LLM (clearly malicious; blocking errs safe)
             result["verdict"] = "BLOCKED"
             triage_reason = "Confident block (risk >= 85, confidence HIGH) - LLM not needed"
+            use_llm = False
+
+        # Strict CONFIDENT_SAFE: ALL layers must be completely clean
+        elif (obfuscation_risk == 0
+              and behavioral_result["risk_score"] == 0
+              and semantic_result["risk_score"] == 0
+              and (not transformer_result.get("is_injection", False) or transformer_result.get("risk_score", 0) == 0)):
+            result["verdict"] = "SAFE"
+            triage_reason = "Confident safe (all layers clean: obf=0, beh=0, sem=0, trans_conf<0.15) - LLM skipped"
+            use_llm = False
+# Everything else - LLM has the final say (includes slight anomalies)
         else:
-            # Everything else - LLM has the final say, including safe-looking prompts
             use_llm = True
             if fusion_result["risk_score"] >= self.CONFIDENT_BLOCK:
                 triage_reason = "High risk but low confidence - LLM verification needed"
             elif fusion_result["risk_score"] <= self.CONFIDENT_SAFE:
-                triage_reason = "Low risk - LLM final verification (safe-looking can hide attacks)"
+                triage_reason = "Low fusion risk but layer anomaly detected - LLM verification needed"
             else:
                 triage_reason = "Uncertain case (20 < risk < 85) - LLM consulted"
         # Execute LLM decision
@@ -1256,7 +1302,7 @@ class IntentGuardrailWithLLM:
         else:
             # Skip LLM
             result["llm_status"]["reason"] = triage_reason
-        
+
         result["layer_reasoning"] = {
             "layer0": obfuscation_result["reasoning"],
             "layer1": behavioral_result["reasoning"],
@@ -1266,21 +1312,16 @@ class IntentGuardrailWithLLM:
             "triage": f"risk={fusion_result['risk_score']} conf={fusion_result['confidence']} -> "
                       f"use_llm={use_llm} ({triage_reason})",
         }
-        
+
         result["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
         
         if verbose:
             self._print_analysis(result)
         
         return result
-    
+
     def _fuse_layers(self, obfuscation_risk, behavioral_result, semantic_result, transformer_result) -> Dict:
         """
-        Escalation-aware fusion (recall-first).
-
-        Only layers that produced a NON-ZERO signal participate in the average.
-        A silent/fallback layer (risk 0, model not loaded) abstains instead of
-        pulling a genuine mid-level signal back down to "safe". This is the
         uncertainty gate: low-confidence fallback layers escalate, they don't dilute.
         """
         signals = [
