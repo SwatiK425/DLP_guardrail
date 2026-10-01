@@ -99,14 +99,24 @@ def byok_status_html(session_guardrail: Optional["IntentGuardrailWithLLM"] = Non
             "Enter a key below to enable live LLM verification of uncertain cases.</div>"
         )
     key = mask_key(judge.api_key)
-    status = judge.get_status()
+    # Get status but handle non-serializable objects
+    try:
+        status = judge.get_status()
+        # Ensure status is serializable
+        if hasattr(status, '__dict__'):
+            status = {k: v for k, v in status.__dict__.items() if not callable(v) and not k.startswith('_')}
+        elif not isinstance(status, dict):
+            status = {}
+    except:
+        status = {'requests_used': 0, 'rate_limit': 60, 'requests_remaining': 60}
+    
     return (
         f"<div style='padding:15px;border-radius:8px;background:#e6ffe6;border-left:4px solid #44aa44'>"
         f"<p><b>✅ LLM judge attached</b></p>"
         f"<p>provider=<b>{judge.provider}</b>, model=<b>{judge.model}</b>, "
         f"key=<b>{key}</b></p>"
-        f"<p><small>Rate budget: {status['requests_used']}/{status['rate_limit']} used "
-        f"({status['requests_remaining']} remaining this minute)</small></p>"
+        f"<p><small>Rate budget: {status.get('requests_used', 0)}/{status.get('rate_limit', 60)} used "
+        f"({status.get('requests_remaining', 60)} remaining this minute)</small></p>"
         f"</div>"
     )
 
