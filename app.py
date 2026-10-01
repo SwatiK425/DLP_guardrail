@@ -161,7 +161,7 @@ def clear_key(session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> t
     )
 
 
-def analyze_individual(prompt: str) -> tuple:
+def analyze_individual(prompt: str, session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> tuple:
     """
     Analyze a single prompt
     
@@ -170,6 +170,9 @@ def analyze_individual(prompt: str) -> tuple:
     """
     if not prompt or len(prompt.strip()) == 0:
         return "⚠️ Please enter a prompt", "", "", ""
+    
+    # Get session guardrail
+    guardrail = get_session_guardrail(session_guardrail)
     
     # Analyze
     result = guardrail.analyze(prompt, verbose=False)
