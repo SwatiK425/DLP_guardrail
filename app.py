@@ -136,8 +136,8 @@ def parse_provider_choice(choice: str) -> str:
 
 
 def attach_key(provider_choice: str, key: str, model: str, 
-               session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> tuple:
-    """Attach key to session-specific guardrail. Returns (html, updated_session_guardrail)."""
+               session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> str:
+    """Attach key to session-specific guardrail. Returns HTML status string."""
     guardrail = get_session_guardrail(session_guardrail)
     provider = parse_provider_choice(provider_choice)
     key = (key or "").strip()
@@ -145,29 +145,26 @@ def attach_key(provider_choice: str, key: str, model: str,
         return (
             "<div style='background:#fff0f0;border-left:4px solid #ff4444;padding:15px;border-radius:8px'>"
             "<b>❌ No key entered.</b> Paste your API key for that provider (or it is read "
-            "from the provider's env var if already set).</div>",
-            guardrail
+            "from the provider's env var if already set).</div>"
         )
     ok = guardrail.set_llm_judge(provider=provider, api_key=key, model=(model.strip() or None))
     if ok:
-        return byok_status_html(guardrail), guardrail
+        return byok_status_html(guardrail)
 
     return (
         "<div style='background:#fff0f0;border-left:4px solid #ff4444;padding:15px;border-radius:8px'>"
-        "<b>\\u274c Could not attach the key.</b> Check the console output for the provider error.</div>",
-        guardrail
+        "<b>\\u274c Could not attach the key.</b> Check the console output for the provider error.</div>"
     )
 
 
-def clear_key(session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> tuple:
-    """Clear key for this session only. Returns (html, updated_session_guardrail)."""
+def clear_key(session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> str:
+    """Clear key for this session only. Returns HTML status string."""
     guardrail = get_session_guardrail(session_guardrail)
     guardrail.llm_judge = None
     guardrail.api_key = None
     return (
         "<div style='background:#f5f5f5;border-left:4px solid #888;padding:15px;border-radius:8px'>"
-        "🔒 Key cleared. Guardrail running on heuristic layers only.</div>",
-        guardrail
+        "🔒 Key cleared. Guardrail running on heuristic layers only.</div>"
     )
 
 
