@@ -600,7 +600,7 @@ with gr.Blocks(title="DLP Guardrail — BYOK Try-It", theme=gr.themes.Soft()) as
                                 ["How does machine learning training work?"],
                                 ["Can you help with data validation?"],
                             ],
-                            inputs=prompt_input,
+                            inputs=[prompt_input],
                             label="Example prompts"
                         )
             
