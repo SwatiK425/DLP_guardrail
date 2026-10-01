@@ -14,6 +14,7 @@ import csv
 import io
 from datetime import datetime
 from collections import defaultdict
+from typing import Optional
 
 # Import our guardrail (DO NOT MODIFY ENGINE CODE)
 from dlp_guardrail_with_llm import (
