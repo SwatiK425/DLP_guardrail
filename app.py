@@ -50,7 +50,12 @@ except Exception as _shim_err:  # pragma: no cover
 # Initialize guardrail ONCE (heavy layers / fastembed semantic model load here ~a few sec).
 # No key at startup -> starts in fallback (fully working) mode; the user attaches
 # their own key per session via the BYOK panel (fast runtime set_llm_judge swap).
-guardrail = IntentGuardrailWithLLM()
+def create_guardrail():
+    """Factory function to create a fresh guardrail instance."""
+    return IntentGuardrailWithLLM()
+
+# Global base guardrail (no key attached) - used as template for new sessions
+_base_guardrail = create_guardrail()
 
 # If the deploy env already sets a provider key, attach it up front so deployments
 # with LLM_PROVIDER can serve LLM verdicts without the user typing a key.
@@ -63,18 +68,27 @@ if not _provider_to_attach:
             _provider_to_attach = _p
             break
 if _provider_to_attach:
-    guardrail.set_llm_judge(
+    _base_guardrail.set_llm_judge(
         provider=_provider_to_attach,
         model=os.environ.get("LLM_MODEL"),
     )
 
 
 # ===========================================================================
-# BYOK helpers
+# BYOK helpers - now session-aware
 # ===========================================================================
 
-def byok_status_html() -> str:
+def get_session_guardrail(session_guardrail: Optional["IntentGuardrailWithLLM"]) -> "IntentGuardrailWithLLM":
+    """Get or create a guardrail instance for this session."""
+    if session_guardrail is None:
+        # Create a fresh instance cloned from base (no key attached)
+        return create_guardrail()
+    return session_guardrail
+
+
+def byok_status_html(session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> str:
     """Render the current LLM-judge status panel (masked key, provider, model)."""
+    guardrail = get_session_guardrail(session_guardrail)
     judge = guardrail.llm_judge
     if not judge:
         return (
@@ -110,31 +124,39 @@ def parse_provider_choice(choice: str) -> str:
     return "google"
 
 
-def attach_key(provider_choice: str, key: str, model: str) -> str:
+def attach_key(provider_choice: str, key: str, model: str, 
+               session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> tuple:
+    """Attach key to session-specific guardrail. Returns (html, updated_session_guardrail)."""
+    guardrail = get_session_guardrail(session_guardrail)
     provider = parse_provider_choice(provider_choice)
     key = (key or "").strip()
     if not key:
         return (
             "<div style='background:#fff0f0;border-left:4px solid #ff4444;padding:15px;border-radius:8px'>"
             "<b>❌ No key entered.</b> Paste your API key for that provider (or it is read "
-            "from the provider's env var if already set).</div>"
+            "from the provider's env var if already set).</div>",
+            guardrail
         )
     ok = guardrail.set_llm_judge(provider=provider, api_key=key, model=(model.strip() or None))
     if ok:
-        return byok_status_html()
+        return byok_status_html(guardrail), guardrail
 
     return (
         "<div style='background:#fff0f0;border-left:4px solid #ff4444;padding:15px;border-radius:8px'>"
-        "<b>\u274c Could not attach the key.</b> Check the console output for the provider error.</div>"
+        "<b>\\u274c Could not attach the key.</b> Check the console output for the provider error.</div>",
+        guardrail
     )
 
 
-def clear_key() -> str:
+def clear_key(session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> tuple:
+    """Clear key for this session only. Returns (html, updated_session_guardrail)."""
+    guardrail = get_session_guardrail(session_guardrail)
     guardrail.llm_judge = None
     guardrail.api_key = None
     return (
         "<div style='background:#f5f5f5;border-left:4px solid #888;padding:15px;border-radius:8px'>"
-        "🔒 Key cleared. Guardrail running on heuristic layers only.</div>"
+        "🔒 Key cleared. Guardrail running on heuristic layers only.</div>",
+        guardrail
     )
 
 
@@ -688,4 +710,4 @@ with gr.Blocks(title="DLP Guardrail — BYOK Try-It", theme=gr.themes.Soft()) as
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, allowed_paths=["/api/predict"])
