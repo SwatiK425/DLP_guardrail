@@ -82,3 +82,7 @@ eval_in_scope.csv
 .gitignore
 .gitignore
 INVESTMENT_REVIEW_NIKESH_ARORA.md
+EVAL_DATASET_SPECIFICATION.md
+eval_golden_test.csv
+eval_dev_train.csv
+eval_detailed_traces.json
