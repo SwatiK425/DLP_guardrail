@@ -22,6 +22,7 @@ models/
 # ---- Build/runtime ----
 venv/
 .venv/
+.uv-cache/
 dist/
 build/
 *.log
@@ -33,26 +34,14 @@ build/
 .vscode/
 .hermes/
 
-# ---- Dev/test artifacts (stay local, never pushed) ----
-benchmark.py
-benchmark_results_store.py
-benchmark_results/
-test_engine.py
-test_dlp_gate.py
-test_judge.py
+# ---- Investor repo is slim by design ----
+# Only these are tracked (required to run):
+#   README.md, app.py, dlp_gate.py, dlp_guardrail_with_llm.py,
+#   requirements.txt, INVESTOR_BRIEF.md, .gitignore
+# Everything below stays local-only (R&D, evals, filings, internal notes).
 
-# ---- Internal docs / scratch (stay local) ----
-DLP_GUARDRAIL.md
-HANDOFF.md
-PROPOSAL.md
-SYSTEM_DESIGN.md
-My notes.txt
-INTELLIGENCE_PIPELINE.md
-PROOF_OF_WORK_POSITIONING.md
-INVESTMENT_REVIEW_NIKESH_ARORA.md
-EVAL_DATASET_SPECIFICATION.md
-
-# ---- Eval artifacts (stay local) ----
+# ---- Eval harness + data + results (local-only) ----
+Evals/
 eval_detailed_traces.json
 eval_results_summary.csv
 eval_dryrun.csv
@@ -64,12 +53,36 @@ run_full_loop.py
 eval_train.csv
 eval_test.csv
 
-# ---- Proof of work / content strategy (stay local) ----
-proof_of_work/
-
-# ---- Experimental / scratch (stay local) ----
+# ---- Experiments + pipelines (local-only) ----
+experiments/
+benchmark.py
+benchmark_results_store.py
+benchmark_results/
+test_engine.py
+test_dlp_gate.py
+test_judge.py
 test_change*.py
 _run_nvidia_bench.py
 
-# ---- IDE / misc ----
+# ---- Internal docs / scratch (local-only) ----
+Handoff/
+DLP_GUARDRAIL.md
+HANDOFF.md
+PROPOSAL.md
+SYSTEM_DESIGN.md
+My notes.txt
+INTELLIGENCE_PIPELINE.md
+PROOF_OF_WORK_POSITIONING.md
+INVESTMENT_REVIEW_NIKESH_ARORA.md
+EVAL_DATASET_SPECIFICATION.md
 INVESTOR_EVALUATION*.md
+
+# ---- Content strategy (local-only) ----
+proof_of_work/
+
+# ---- Tests (local-only, run before push) ----
+tests/
+
+# ---- Raw filings + telemetry (local-only, large) ----
+sec-edgar-filings/
+telemetry/
