@@ -66,7 +66,7 @@ PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "openrouter": "openrouter/auto",
     "opencode-zen": "deepseek-coder",
-    "nvidia": "meta/llama-3.3-70b-instruct",
+    "nvidia": "meta/llama-3.2-11b-vision-instruct",
 }
 
 # Each provider reads its key ONLY from its own env var (BYOK contract).
@@ -87,9 +87,7 @@ def mask_key(key: str) -> str:
     """Never print a key — return a short mask so the user can confirm which key is live."""
     if not key:
         return "<unset>"
-    if len(key) <= 8:
-        return "*" * len(key)
-    return f"{key[:3]}...{key[-4:]}"
+    return "<configured>"
 
 
 class ProviderLLMJudge:
@@ -221,14 +219,14 @@ Be conservative: When uncertain, lean toward higher risk scores."""
             import requests
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code != 200:
-                print(f"⚠️  [BYOK:{self.provider}] HTTP {resp.status_code}: {resp.text[:200]}")
+                print(f"⚠️  [BYOK:{self.provider}] HTTP {resp.status_code}")
                 return None
             return resp.json()
         except ImportError:
             print("⚠️  [BYOK] requests not installed. Run: pip install requests")
             return None
         except Exception as e:
-            print(f"⚠️  [BYOK:{self.provider}] request failed: {e}")
+            print(f"⚠️  [BYOK:{self.provider}] request failed ({type(e).__name__})")
             return None
 
     def _call_provider(self, full_prompt: str) -> Optional[str]:
@@ -327,75 +325,80 @@ Be conservative: When uncertain, lean toward higher risk scores."""
             "detected_threats": [],
         }
 
-        def analyze_with_fallback(self, prompt: str, max_retries: int = 2) -> Optional[Dict]:
-            """Analyze with automatic fallback to other providers on failure.
+    def analyze_with_fallback(self, prompt: str, max_retries: int = 2) -> Optional[Dict]:
+        """Analyze with automatic fallback to other providers on failure.
 
-            Tries providers in fallback_chain order, skipping unhealthy ones.
-            Returns first successful result or None if all fail.
-            """
-            # Build ordered list of providers to try
-            providers_to_try = []
-            for p in self.fallback_chain:
-                if p in self.all_keys and self._is_healthy(p):
-                    providers_to_try.append(p)
+        Tries providers in fallback_chain order, skipping unhealthy ones.
+        Returns first successful result or None if all fail.
+        """
+        # Build ordered list of providers to try
+        providers_to_try = []
+        for p in self.fallback_chain:
+            if p in self.all_keys and self._is_healthy(p):
+                providers_to_try.append(p)
 
-            if not providers_to_try:
-                print("⚠️  [BYOK] No healthy providers available in fallback chain")
-                return None
+        if not providers_to_try:
+            print("⚠️  [BYOK] No healthy providers available in fallback chain")
+            return None
 
-            last_error = None
-            for provider in providers_to_try:
-                for attempt in range(max_retries):
-                    # Switch to this provider temporarily
-                    orig_provider = self.provider
-                    orig_model = self.model
-                    orig_base_url = self.base_url
-                    orig_api_key = self.api_key
+        last_error = None
+        for provider in providers_to_try:
+            for attempt in range(max_retries):
+                # Switch to this provider temporarily
+                orig_provider = self.provider
+                orig_model = self.model
+                orig_base_url = self.base_url
+                orig_api_key = self.api_key
 
-                    self.provider = provider
-                    self.api_key = self.all_keys[provider]
-                    self.base_url = PROVIDER_BASE_URLS[provider].rstrip("/")
+                self.provider = provider
+                self.api_key = self.all_keys[provider]
+                self.base_url = PROVIDER_BASE_URLS[provider].rstrip("/")
+                # Preserve the user-specified model for the primary provider
+                if provider == orig_provider and self.model and self.model != PROVIDER_DEFAULT_MODELS.get(provider):
+                    # Keep the user's model for the primary provider
+                    pass
+                else:
                     self.model = PROVIDER_DEFAULT_MODELS[provider]
 
-                    # For Google, discover model if not set
-                    if provider == "google" and orig_provider != "google":
-                        self.model = self._discover_google_model() or PROVIDER_DEFAULT_MODELS["google"]
+                # For Google, discover model if not set and no user model
+                if provider == "google" and (not self.model or self.model == PROVIDER_DEFAULT_MODELS["google"]):
+                    self.model = self._discover_google_model() or PROVIDER_DEFAULT_MODELS["google"]
 
-                    try:
-                        print(f"🔄 [BYOK] Trying provider={provider}, model={self.model} (attempt {attempt+1}/{max_retries})")
-                        result = self.analyze(prompt)
+                try:
+                    print(f"🔄 [BYOK] Trying provider={provider}, model={self.model} (attempt {attempt+1}/{max_retries})")
+                    result = self.analyze(prompt)
 
-                        if result:
-                            self._record_success(provider)
-                            # Restore original provider
-                            self.provider = orig_provider
-                            self.model = orig_model
-                            self.base_url = orig_base_url
-                            self.api_key = orig_api_key
-                            return result
-                        else:
-                            last_error = f"{provider}: rate limited or empty response"
-                            self._record_failure(provider)
-
-                    except Exception as e:
-                        last_error = f"{provider}: {e}"
-                        self._record_failure(provider)
-                        print(f"⚠️  [BYOK:{provider}] Attempt {attempt+1} failed: {e}")
-
-                    finally:
-                        # Restore original provider for next iteration
+                    if result:
+                        self._record_success(provider)
+                        # Restore original provider
                         self.provider = orig_provider
                         self.model = orig_model
                         self.base_url = orig_base_url
                         self.api_key = orig_api_key
+                        return result
+                    else:
+                        last_error = f"{provider}: rate limited or empty response"
+                        self._record_failure(provider)
 
-                    # Brief delay before retry/next provider
-                    if attempt < max_retries - 1:
-                        import time
-                        time.sleep(1.5 * (attempt + 1))
+                except Exception as e:
+                    last_error = f"{provider}: {type(e).__name__}"
+                    self._record_failure(provider)
+                    print(f"⚠️  [BYOK:{provider}] Attempt {attempt+1} failed ({type(e).__name__})")
 
-            print(f"⚠️  [BYOK] All providers exhausted. Last error: {last_error}")
-            return None
+                finally:
+                    # Restore original provider for next iteration
+                    self.provider = orig_provider
+                    self.model = orig_model
+                    self.base_url = orig_base_url
+                    self.api_key = orig_api_key
+
+                # Brief delay before retry/next provider
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(1.5 * (attempt + 1))
+
+        print(f"⚠️  [BYOK] All providers exhausted. Last error: {last_error}")
+        return None
 
     def _score_to_verdict(self, score: int) -> str:
         if score >= 80:
@@ -528,7 +531,6 @@ class ObfuscationDetector:
         reasoning = []
         if techniques:
             reasoning.append(f"{len(techniques)} technique(s) applied: {', '.join(techniques)}")
-            reasoning.append(f"normalized: {normalized[:80]!r}")
         else:
             reasoning.append("no obfuscation detected -> risk 0")
 
@@ -1156,13 +1158,14 @@ class IntentGuardrailWithLLM:
         start_time = time.time()
         
         result = {
-            "prompt": prompt[:100] + "..." if len(prompt) > 100 else prompt,
+            "prompt_length": len(prompt),
             "risk_score": 0,
             "verdict": "SAFE",
             "confidence": "HIGH",
             "layers": [],
             "llm_status": {
                 "used": False,
+                "attempted": False,
                 "available": self.llm_judge is not None,
                 "reason": ""
             }
@@ -1181,8 +1184,7 @@ class IntentGuardrailWithLLM:
             "name": "Layer 0: Obfuscation",
             "risk": obfuscation_risk,
             "details": ", ".join(obfuscation_result["techniques"]) or "Clean",
-            "reasoning": (["normalized text: " + normalized_prompt[:80]]
-                          + [f"technique: {t}" for t in obfuscation_result["techniques"]]
+            "reasoning": ([f"technique: {t}" for t in obfuscation_result["techniques"]]
                           or ["no obfuscation detected -> risk 0"])
         })
         
@@ -1208,6 +1210,8 @@ class IntentGuardrailWithLLM:
                 "triage": "behavioral risk >= 85 -> confident BLOCK, LLM skipped"
             }
             result["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
+            result["local_time_ms"] = result["total_time_ms"]
+            result["llm_time_ms"] = 0.0
             if verbose:
                 self._print_analysis(result)
             return result
@@ -1270,7 +1274,7 @@ class IntentGuardrailWithLLM:
             result["verdict"] = "SAFE"
             triage_reason = "Confident safe (all layers clean: obf=0, beh=0, sem=0, trans_conf<0.15) - LLM skipped"
             use_llm = False
-# Everything else - LLM has the final say (includes slight anomalies)
+        # Everything else - LLM has the final say (includes slight anomalies)
         else:
             use_llm = True
             if fusion_result["risk_score"] >= self.CONFIDENT_BLOCK:
@@ -1279,10 +1283,23 @@ class IntentGuardrailWithLLM:
                 triage_reason = "Low fusion risk but layer anomaly detected - LLM verification needed"
             else:
                 triage_reason = "Uncertain case (20 < risk < 85) - LLM consulted"
+        result["local_time_ms"] = round((time.time() - start_time) * 1000, 2)
+        result["llm_time_ms"] = 0.0
+
         # Execute LLM decision
         if use_llm:
             if self.llm_judge:
-                llm_result = self.llm_judge.analyze(normalized_prompt)
+                result["llm_status"]["attempted"] = True
+                llm_start = time.time()
+                try:
+                    # Use fallback chain for resilience
+                    llm_result = self.llm_judge.analyze_with_fallback(normalized_prompt)
+                except Exception as exc:
+                    llm_result = None
+                    llm_failure = f"judge error ({type(exc).__name__})"
+                else:
+                    llm_failure = "judge unavailable, failed, or rate limited"
+                result["llm_time_ms"] = round((time.time() - llm_start) * 1000, 2)
                 
                 if llm_result:
                     # LLM available and succeeded
@@ -1292,17 +1309,16 @@ class IntentGuardrailWithLLM:
                     result["llm_status"]["reason"] = triage_reason
                     result["llm_reasoning"] = llm_result["reasoning"]
                 else:
-                    # LLM rate limited
-                    result["verdict"] = self._score_to_verdict(fusion_result["risk_score"])
-                    result["llm_status"]["reason"] = f"{triage_reason} BUT rate limited - using layer fusion"
+                    # Fail closed when the case requires the unavailable judge.
+                    result["verdict"] = "BLOCKED"
+                    result["llm_status"]["reason"] = f"{triage_reason}; fail-closed: {llm_failure}"
             else:
-                # LLM not available
-                result["verdict"] = self._score_to_verdict(fusion_result["risk_score"])
-                result["llm_status"]["reason"] = f"{triage_reason} BUT LLM unavailable - using layer fusion"
+                # Fail closed when the case requires a judge but none is configured.
+                result["verdict"] = "BLOCKED"
+                result["llm_status"]["reason"] = f"{triage_reason}; fail-closed: LLM judge unavailable"
         else:
             # Skip LLM
             result["llm_status"]["reason"] = triage_reason
-
         result["layer_reasoning"] = {
             "layer0": obfuscation_result["reasoning"],
             "layer1": behavioral_result["reasoning"],
@@ -1380,7 +1396,7 @@ class IntentGuardrailWithLLM:
         print("\n" + "="*80)
         print(f"📊 ANALYSIS RESULT")
         print("="*80)
-        print(f"Prompt: {result['prompt']}")
+        print(f"Prompt length: {result['prompt_length']} characters")
         print(f"Verdict: {result['verdict']}")
         print(f"Risk Score: {result['risk_score']}/100")
         print(f"Confidence: {result['confidence']}")
