@@ -36,7 +36,7 @@ build/
 
 # ---- Investor repo is slim by design ----
 # Only these are tracked (required to run):
-#   README.md, app.py, dlp_gate.py, dlp_guardrail_with_llm.py,
+#   README.md, app.py, dlp_guardrail_with_llm.py,
 #   requirements.txt, INVESTOR_BRIEF.md, .gitignore
 # Everything below stays local-only (R&D, evals, filings, internal notes).
 
