@@ -12,13 +12,16 @@ import os
 import json
 import csv
 import io
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Optional
 
 # Import our guardrail (DO NOT MODIFY ENGINE CODE)
 from dlp_guardrail_with_llm import (
     IntentGuardrailWithLLM,
+    ProviderLLMJudge,
     PROVIDER_BASE_URLS,
     PROVIDER_DEFAULT_MODELS,
     PROVIDER_ENV_KEYS,
@@ -73,6 +76,76 @@ if _provider_to_attach:
         provider=_provider_to_attach,
         model=os.environ.get("LLM_MODEL"),
     )
+
+
+# ===========================================================================
+# Per-session judge store — fixes silent BYOK loss WITHOUT changing the API
+# contract (same fn order, same inputs/outputs, so fn_index mapping is stable).
+# Gradio injects `request: gr.Request` without exposing it as an API input;
+# we key the lightweight ProviderLLMJudge (no model reload) by session_hash.
+# ===========================================================================
+
+_session_judges: dict = {}  # session_hash -> {"judge": ProviderLLMJudge, "seen": datetime}
+_judge_swap_lock = threading.Lock()
+_SESSION_TTL = timedelta(hours=24)
+_SESSION_CAP = 1000
+
+
+def _prune_session_judges() -> None:
+    now = datetime.now()
+    stale = [k for k, v in _session_judges.items() if now - v["seen"] > _SESSION_TTL]
+    for k in stale:
+        del _session_judges[k]
+    while len(_session_judges) > _SESSION_CAP:
+        oldest = min(_session_judges, key=lambda k: _session_judges[k]["seen"])
+        del _session_judges[oldest]
+
+
+def _session_id_from(request) -> Optional[str]:
+    if request is None:
+        return None
+    return getattr(request, "session_hash", None)
+
+
+def _lookup_session_judge(request) -> Optional["ProviderLLMJudge"]:
+    sid = _session_id_from(request)
+    if not sid:
+        return None
+    entry = _session_judges.get(sid)
+    if not entry:
+        return None
+    entry["seen"] = datetime.now()
+    return entry["judge"]
+
+
+def _store_session_judge(request, judge: "ProviderLLMJudge") -> None:
+    sid = _session_id_from(request)
+    if not sid:
+        return
+    _prune_session_judges()
+    _session_judges[sid] = {"judge": judge, "seen": datetime.now()}
+
+
+def _drop_session_judge(request) -> None:
+    sid = _session_id_from(request)
+    if sid:
+        _session_judges.pop(sid, None)
+
+
+def _analyze_with_session_judge(prompt: str, request) -> dict:
+    """Run analysis on the shared base guardrail, swapping in the caller's
+    session judge (if any) under a lock. Falls back to the base judge
+    (env key, if configured) when the session attached none."""
+    judge = _lookup_session_judge(request)
+    if judge is None:
+        return _base_guardrail.analyze(prompt, verbose=False)
+    with _judge_swap_lock:
+        prev = _base_guardrail.llm_judge
+        _base_guardrail.llm_judge = judge
+        try:
+            return _base_guardrail.analyze(prompt, verbose=False)
+        finally:
+            _base_guardrail.llm_judge = prev
 
 
 # ===========================================================================
@@ -135,10 +208,14 @@ def parse_provider_choice(choice: str) -> str:
     return "google"
 
 
-def attach_key(provider_choice: str, key: str, model: str, 
-               session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> str:
-    """Attach key to session-specific guardrail. Returns HTML status string."""
-    guardrail = get_session_guardrail(session_guardrail)
+def attach_key(provider_choice: str, key: str, model: str,
+               session_guardrail: Optional["IntentGuardrailWithLLM"] = None,
+               request: Optional["gr.Request"] = None) -> str:
+    """Attach key for this session. The judge is stored server-side keyed by
+    session_hash (via `request`, which Gradio injects without exposing it as
+    an API input — the fn_index contract is unchanged). The legacy
+    `session_guardrail` param is accepted but ignored.
+    Returns HTML status string."""
     provider = parse_provider_choice(provider_choice)
     key = (key or "").strip()
     if not key:
@@ -147,42 +224,52 @@ def attach_key(provider_choice: str, key: str, model: str,
             "<b>❌ No key entered.</b> Paste your API key for that provider (or it is read "
             "from the provider's env var if already set).</div>"
         )
-    ok = guardrail.set_llm_judge(provider=provider, api_key=key, model=(model.strip() or None))
-    if ok:
-        return byok_status_html(guardrail)
+    judge = None
+    try:
+        judge = ProviderLLMJudge(
+            provider, key, model=(model.strip() or None),
+        )
+    except Exception as exc:
+        print(f"⚠️  Failed to attach judge: {exc}")
+    if judge is None:
+        return (
+            "<div style='background:#fff0f0;border-left:4px solid #ff4444;padding:15px;border-radius:8px'>"
+            "<b>❌ Could not attach the key.</b> Check the console output for the provider error.</div>"
+        )
+    _store_session_judge(request, judge)
+    # Render status from the just-attached judge WITHOUT a heavy guardrail
+    # rebuild (byok_status_html only reads `.llm_judge`).
+    return byok_status_html(SimpleNamespace(llm_judge=judge))
 
-    return (
-        "<div style='background:#fff0f0;border-left:4px solid #ff4444;padding:15px;border-radius:8px'>"
-        "<b>\\u274c Could not attach the key.</b> Check the console output for the provider error.</div>"
-    )
 
-
-def clear_key(session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> str:
-    """Clear key for this session only. Returns HTML status string."""
-    guardrail = get_session_guardrail(session_guardrail)
-    guardrail.llm_judge = None
-    guardrail.api_key = None
+def clear_key(session_guardrail: Optional["IntentGuardrailWithLLM"] = None,
+              request: Optional["gr.Request"] = None) -> str:
+    """Clear the session judge (server-side store). Returns HTML status string."""
+    if session_guardrail is not None:
+        session_guardrail.llm_judge = None
+        session_guardrail.api_key = None
+    _drop_session_judge(request)
     return (
         "<div style='background:#f5f5f5;border-left:4px solid #888;padding:15px;border-radius:8px'>"
         "🔒 Key cleared. Guardrail running on heuristic layers only.</div>"
     )
 
 
-def analyze_individual(prompt: str, session_guardrail: Optional["IntentGuardrailWithLLM"] = None) -> tuple:
+def analyze_individual(prompt: str, session_guardrail: Optional["IntentGuardrailWithLLM"] = None,
+                       request: Optional["gr.Request"] = None) -> tuple:
     """
-    Analyze a single prompt
-    
+    Analyze a single prompt. Uses the caller's session judge when one was
+    attached via attach_key (looked up by session_hash); otherwise the base
+    guardrail's judge (env key, if configured).
+
     Returns:
         tuple: (verdict_html, details_html, layers_html, llm_status_html)
     """
     if not prompt or len(prompt.strip()) == 0:
         return "⚠️ Please enter a prompt", "", "", ""
-    
-    # Get session guardrail
-    guardrail = get_session_guardrail(session_guardrail)
-    
-    # Analyze
-    result = guardrail.analyze(prompt, verbose=False)
+
+    # Analyze (session judge swapped in under lock when present)
+    result = _analyze_with_session_judge(prompt, request)
     
     # Format verdict with color
     verdict_colors = {
@@ -348,13 +435,14 @@ def analyze_csv(csv_path) -> tuple:
     if 'prompt' not in test_cases[0]:
         return "❌ CSV must have 'prompt' column", None, None
     
-    # Analyze all prompts
+    # Analyze all prompts on the shared base guardrail
+    # (batch callers use the env-key judge, if configured).
     results = []
     for test_case in test_cases:
         prompt = test_case['prompt']
         expected = test_case.get('expected_verdict', '')
-        
-        result = guardrail.analyze(prompt, verbose=False)
+
+        result = _base_guardrail.analyze(prompt, verbose=False)
         
         results.append({
             'prompt': prompt,
